@@ -88,7 +88,10 @@ SMB (Windows, macOS, a NAS, Samba) and NFS. The router needs a little support
 software for them, which the Network folder tab installs from the router's
 own package source with one click (`kmod-fs-cifs cifsmount` for SMB, plus
 `kmod-crypto-md4` on kernels before 5.15, such as GL firmware 4.x;
-`kmod-fs-nfs kmod-fs-nfs-v3 kmod-fs-nfs-v4 nfs-utils` for NFS). The password
+`kmod-fs-nfs kmod-fs-nfs-v3 kmod-fs-nfs-v4 nfs-utils` for NFS).
+**On GL.iNet firmware Red Book does not install NFS support**: GL's own NFS
+kernel modules crashed a GL-BE9300 (firmware 4.10.1) as they loaded. Use SMB
+there. The password
 is kept in a file only root can read; it is never shown again, never put on a
 command line, and never written to a log.
 

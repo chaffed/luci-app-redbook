@@ -272,6 +272,16 @@ check "! grep -rqF 'w\"o' $H /var/run/redbook && ! logread | grep -qF 'w\"o' && 
 check "redbook lines system 5 rbtest | jsonfilter -e @.text | grep -q rbtest-notice" "lines: returns the newest lines, filtered"
 check "[ \"\$(redbook lines nosuch 5 | jsonfilter -e @.error)\" = unknown_source ]" "lines: an unknown source is refused"
 check "redbook drives | jsonfilter -e '@.drives[*].path' | grep -qx /mnt/usb" "drives: the drive is listed"
+
+# On GL firmware NFS support is not installed (GL's modules crashed a BE9300).
+check "[ \"\$(redbook status | jsonfilter -e @.support.nfs_installable)\" = true ]" "plain OpenWrt: NFS support can be installed"
+echo 4.10.1 > /tmp/glversion
+check "[ \"\$(GL_VERSION_FILE=/tmp/glversion redbook install-support nfs | jsonfilter -e @.reason)\" = nfs_not_on_gl ] && [ ! -e /var/run/redbook/install.pid ]" "GL firmware: installing NFS support is refused, nothing started"
+check "[ \"\$(GL_VERSION_FILE=/tmp/glversion redbook status | jsonfilter -e @.support.nfs_installable)\" = false ]" "GL firmware: status says NFS support cannot be installed"
+uci set redbook.main.net_type=nfs; uci set redbook.main.net_server=192.0.2.9; uci set redbook.main.net_share=/x; uci commit redbook
+check "[ \"\$(GL_VERSION_FILE=/tmp/glversion redbook test-network | jsonfilter -e @.reason)\" = nfs_not_on_gl ]" "GL firmware: the NFS test says why there is no support"
+uci set redbook.main.net_type=smb; uci -q delete redbook.main.net_server; uci -q delete redbook.main.net_share; uci commit redbook
+rm -f /tmp/glversion
 check "ubus call luci.redbook status >/dev/null 2>&1 || ! pidof rpcd" "rpcd: the status call answers"
 
 [ "$fail" = 0 ] && echo && echo "all checks passed"

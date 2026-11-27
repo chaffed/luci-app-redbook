@@ -259,6 +259,11 @@ have_md4() {
 	grep -q '^name *: md4$' /proc/crypto 2>/dev/null || modprobe md4 2>/dev/null || insmod md4 2>/dev/null
 	grep -q '^name *: md4$' /proc/crypto 2>/dev/null
 }
+# GL firmware's own NFS kernel modules panicked a GL-BE9300 (4.10.1) as
+# they loaded, restarting the router: on GL firmware Red Book does not
+# install NFS support. NFS is still used where the router already has it.
+on_gl() { [ -s "${GL_VERSION_FILE:-/etc/glversion}" ]; }
+install_blocked() { [ "$1" = nfs ] && on_gl; }
 net_support() {
 	case "$1" in
 		smb) command -v mount.cifs >/dev/null 2>&1 || return 1
@@ -329,7 +334,7 @@ ensure_net() {
 		umount_net
 	fi
 	if ! net_mounted >/dev/null; then
-		net_support "$NET_TYPE" || { NET_REASON=no_support; return 1; }
+		net_support "$NET_TYPE" || { NET_REASON=no_support; install_blocked "$NET_TYPE" && NET_REASON=nfs_not_on_gl; return 1; }
 		mount_net || return 1
 	fi
 	NET_ROOT=$MNT; [ -n "$NET_FOLDER" ] && NET_ROOT=$MNT/$NET_FOLDER
@@ -1113,8 +1118,9 @@ do_status() {
 	printf '"clock_set":%s,"net_password_set":%s,"net_mounted":%s,"spool_kb":%s,"dropped":%s,' \
 		"$(time_synced && echo true || echo false)" "$( [ -n "$(net_password)" ] && echo true || echo false)" \
 		"$(net_mounted >/dev/null && echo true || echo false)" "$(json_num "${spool_kb:-0}")" "$(json_num "$dropped")"
-	printf '"support":{"smb":%s,"nfs":%s,"installing":%s,"install_result":%s},' \
-		"$(command -v mount.cifs >/dev/null 2>&1 && echo true || echo false)" "$(command -v mount.nfs >/dev/null 2>&1 && echo true || echo false)" \
+	printf '"support":{"smb":%s,"nfs":%s,"nfs_installable":%s,"installing":%s,"install_result":%s},' \
+		"$(net_support smb && echo true || echo false)" "$(net_support nfs && echo true || echo false)" \
+		"$(install_blocked nfs && echo false || echo true)" \
 		"$( [ -f "$RUN_DIR/install.pid" ] && [ -d "/proc/$(cat "$RUN_DIR/install.pid")" ] && echo true || echo false)" \
 		"$(json_str "$(cat "$RUN_DIR/install.result" 2>/dev/null)")"
 	printf '"router":{"dns_logging":%s,"firewall_logging":%s,"syslog_server":%s,"changed_by_redbook":%s},' \
@@ -1205,6 +1211,7 @@ do_install_support() {
 	local p
 	load_config
 	[ -n "$(support_packages "$1")" ] || { echo '{"ok":false,"reason":"unknown_type"}'; return; }
+	install_blocked "$1" && { echo '{"ok":false,"reason":"nfs_not_on_gl"}'; return; }
 	mkdir -p "$RUN_DIR" && chmod 700 "$RUN_DIR"
 	if read -r p 2>/dev/null < "$RUN_DIR/install.pid" && [ -d "/proc/$p" ]; then echo '{"ok":true,"running":true}'; return; fi
 	# Fully detached: rpcd and the GL panel wait on an open stdout.
@@ -1215,6 +1222,7 @@ do_install_run() {
 	local rc pkgs
 	load_config
 	pkgs=$(support_packages "$1"); [ -n "$pkgs" ] || return 1
+	install_blocked "$1" && return 1
 	echo $$ > "$RUN_DIR/install.pid"
 	# shellcheck disable=SC2086
 	{ opkg update && opkg install $pkgs; } > "$RUN_DIR/install.log" 2>&1
