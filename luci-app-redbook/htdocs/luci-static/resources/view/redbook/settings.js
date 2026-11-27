@@ -25,7 +25,7 @@ return view.extend({
 	render: function(st) {
 		var m, s, o, self = this;
 
-		m = new form.Map('redbook', _('Red Book – Settings'), _('Keeps the router's logs on a USB drive or network folder for troubleshooting and security analysis.'));
+		m = new form.Map('redbook', _('Red Book – Settings'), _('Keeps the router\'s logs on a USB drive or network folder for troubleshooting and security analysis.'));
 
 		s = m.section(form.NamedSection, 'main', 'redbook');
 		s.anonymous = true;
