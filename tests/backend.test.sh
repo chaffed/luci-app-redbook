@@ -38,7 +38,7 @@ uci set redbook.main.flush_minutes=15  # the test writes when it wants to
 uci commit redbook
 sh /etc/uci-defaults/80_redbook >/dev/null 2>&1
 sleep 2
-H=/mnt/usb/redbook/rbtest
+H=/mnt/usb/$(redbook status | jsonfilter -e @.folder)
 TODAY=$(date +%Y-%m-%d)
 YDAY=$(date -d "@$(( $(date +%s) - 86400 ))" +%Y-%m-%d)
 
@@ -127,6 +127,7 @@ sleep 1
 redbook flush >/dev/null 2>&1
 check "grep -q rbtest-notice-1 $H/system/$TODAY.log && ! grep -q rbtest-debug-1 $H/system/$TODAY.log" "the system log reaches the drive, filtered by level"
 check "grep -q 'Red Book started recording here' $H/boots/$TODAY.log" "the first start is recorded"
+check "case \"$H\" in /mnt/usb/redbook/rbtest-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) true ;; *) false ;; esac" "the router's folder is its name plus the end of its MAC"
 check "grep -q ' load=.* mem_avail_kb=[0-9]' $H/health/$TODAY.log" "a health sample is recorded"
 check "grep -q -- '--- the kernel log since the router started' $H/kernel/*.log" "the kernel log since start is saved once"
 check "[ \"\$(redbook status | jsonfilter -e @.storage.state)\" = ok ] && [ \"\$(redbook status | jsonfilter -e @.stats.sources.system.files)\" -ge 1 ]" "status: the storage is ok and the files are counted"

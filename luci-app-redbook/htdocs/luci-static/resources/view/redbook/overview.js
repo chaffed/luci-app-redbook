@@ -32,7 +32,7 @@ return view.extend({
 		if (!sto.state)
 			out.push(line('info', [ _('Nothing has been written yet.') ]));
 		else if (sto.state === 'ok')
-			out.push(line('ok', [ _('Writing to %s: %s free of %s. Last written %s.').format(where.format(sto.path),
+			out.push(line('ok', [ _('Writing to %s, in %s: %s free of %s. Last written %s.').format(where.format(sto.path), st.folder,
 				app.size((+sto.free_kb || 0) * 1024), app.size((+sto.total_kb || 0) * 1024), app.when(sto.at)) ]));
 		else
 			out.push(line('warn', [ _('Not writing to %s. %s').format(where.format(sto.path || '?'), app.reasonText(sto.reason)) ]));
@@ -77,7 +77,8 @@ return view.extend({
 			var x = stats[s.id] || {};
 			return E('tr', { 'class': 'tr' }, [
 				E('td', { 'class': 'td' }, [ app.sourceLabel(s.id) ]),
-				E('td', { 'class': 'td' }, [ s.on ? (s.level ? _('yes, from %s up').format(levels[s.level] || s.level) : _('yes')) : _('no') ]),
+				E('td', { 'class': 'td' }, [ !s.on ? _('no') : s.missing && s.id !== 'web' ? _('on, but %s').format(app.missingText(s.missing))
+					: s.level ? _('yes, from %s up').format(levels[s.level] || s.level) : _('yes') ]),
 				E('td', { 'class': 'td' }, [ _('%d days').format(s.days) ]),
 				E('td', { 'class': 'td' }, [ x.files ? app.size(x.today_bytes) : '' ]),
 				E('td', { 'class': 'td' }, [ x.files ? (x.files === 1 ? _('%s in 1 file').format(app.size(x.bytes)) : _('%s in %d files').format(app.size(x.bytes), x.files)) : '' ])

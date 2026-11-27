@@ -170,6 +170,14 @@ var REASONS = {
 	copy_failed: _('Copying to the network folder failed part way; it is tried again at the next write.'),
 	mount_failed: _('The network folder could not be mounted.')
 };
+/* What a log needs that this router lacks. */
+var MISSING = {
+	conntrack: _('this router has no conntrack program (install the conntrack package)'),
+	mesh: _('this router has no mesh logs'),
+	web_log: _('the web server has written no error log yet')
+};
+function missingText(m) { return MISSING[m] || m; }
+
 function reasonText(r) { return REASONS[r] || (r ? _('Failed (%s).').format(r) : ''); }
 
 function size(bytes) {
@@ -234,6 +242,7 @@ return baseclass.extend({
 	checkValue: checkValue,
 	shown: shown,
 	reasonText: reasonText,
+	missingText: missingText,
 	sourceLabel: sourceLabel,
 	size: size,
 	when: when,

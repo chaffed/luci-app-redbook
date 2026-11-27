@@ -150,6 +150,15 @@ load_config() {
 	MESH_DIR=${REDBOOK_MESH_DIR:-/tmp/beerocks/logs}
 	WEB_LOG=${REDBOOK_WEB_LOG:-/tmp/log/nginx/error.log}
 	HOST=$(tr -cd 'A-Za-z0-9._-' < /proc/sys/kernel/hostname 2>/dev/null); HOST=${HOST:-router}
+	# The folder for this router: its name plus the end of its LAN MAC, as
+	# routers often share a name (a GL main router and its mesh node are
+	# both "GL-BE9300") and may write to the same network folder.
+	ROUTER_DIR=$HOST
+	for v in /sys/class/net/br-lan/address /sys/class/net/eth0/address; do
+		[ -r "$v" ] || continue
+		v=$(tr -d ':\n' < "$v" | tr 'A-F' 'a-f' | tail -c 6)
+		case $v in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ROUTER_DIR=$HOST-$v; break ;; esac
+	done
 	read -r BOOT_ID < /proc/sys/kernel/random/boot_id 2>/dev/null; BOOT_ID=${BOOT_ID:-unknown}
 }
 
@@ -309,7 +318,7 @@ ensure_net() {
 		mount_net || return 1
 	fi
 	NET_ROOT=$MNT; [ -n "$NET_FOLDER" ] && NET_ROOT=$MNT/$NET_FOLDER
-	if ! tmo 20 sh -c 'mkdir -p "$1" && : > "$1/.write-test" && rm -f "$1/.write-test"' _ "$NET_ROOT/redbook/$HOST" 2>/dev/null; then
+	if ! tmo 20 sh -c 'mkdir -p "$1" && : > "$1/.write-test" && rm -f "$1/.write-test"' _ "$NET_ROOT/redbook/$ROUTER_DIR" 2>/dev/null; then
 		NET_REASON=not_writable; return 1
 	fi
 }
@@ -323,14 +332,14 @@ resolve_storage() {
 	if [ "$STORAGE" = network ]; then
 		ST_PATH=$(net_label)
 		ensure_net || { ST_REASON=$NET_REASON; return 1; }
-		DEST=$NET_ROOT/redbook/$HOST
+		DEST=$NET_ROOT/redbook/$ROUTER_DIR
 	else
 		[ "$USB_BAD" = 1 ] && { ST_REASON=bad_path; return 1; }
 		p=$USB_PATH
 		[ -n "$p" ] || p=$(list_drives | head -n 1 | cut -d' ' -f1)
 		ST_PATH=$p
 		[ -n "$p" ] && on_usb "$p" || { ST_REASON=no_drive; return 1; }
-		DEST=$p/redbook/$HOST
+		DEST=$p/redbook/$ROUTER_DIR
 		mkdir -p "$DEST" 2>/dev/null && [ -w "$DEST" ] || { ST_REASON=not_writable; return 1; }
 	fi
 	# shellcheck disable=SC2046
@@ -724,7 +733,7 @@ sync_backup() {
 	[ "$STORAGE" = usb ] && [ "$BACKUP" = 1 ] || return 0
 	BK_PATH=$(net_label)
 	ensure_net || { BK_STATE=error; BK_REASON=$NET_REASON; return 1; }
-	b=$NET_ROOT/redbook/$HOST
+	b=$NET_ROOT/redbook/$ROUTER_DIR
 	for src in $SOURCES; do
 		[ -d "$DEST/$src" ] || continue
 		w mkdir -p "$b/$src" || { BK_STATE=error; BK_REASON=not_writable; return 1; }
@@ -1013,6 +1022,15 @@ do_daemon() {
 
 # ----------------------------------------------------------- web interface
 
+# What a source needs that this router lacks (for the Overview), if anything.
+source_missing() {
+	case $1 in
+		conn) command -v conntrack >/dev/null 2>&1 || echo conntrack ;;
+		mesh) [ -d "$MESH_DIR" ] || echo mesh ;;
+		web) [ -f "$WEB_LOG" ] || echo web_log ;;
+	esac
+}
+
 do_status() {
 	local s sep='' running=false dropped spool_kb fw_on=0 sec ip
 	load_config
@@ -1021,8 +1039,8 @@ do_status() {
 	spool_kb=$(( $(spool_bytes) / 1024 ))
 	for sec in $(fw_zones | cut -d' ' -f1); do [ "$(uci -q get "firewall.$sec.log")" = 1 ] && fw_on=1; done
 	ip=$(uci -q get system.@system[0].log_ip)
-	printf '{"version":%s,"enabled":%s,"running":%s,"host":%s,"lan_ip":%s,"storage_kind":%s,"backup":%s,"compress":%s,"flush_minutes":%s,"next":%s,' \
-		"$(json_str "$VERSION")" "$(json_bool "$ENABLED")" "$running" "$(json_str "$HOST")" "$(json_str "$(uci -q get network.lan.ipaddr | cut -d/ -f1)")" \
+	printf '{"version":%s,"enabled":%s,"running":%s,"host":%s,"folder":%s,"lan_ip":%s,"storage_kind":%s,"backup":%s,"compress":%s,"flush_minutes":%s,"next":%s,' \
+		"$(json_str "$VERSION")" "$(json_bool "$ENABLED")" "$running" "$(json_str "$HOST")" "$(json_str "redbook/$ROUTER_DIR")" "$(json_str "$(uci -q get network.lan.ipaddr | cut -d/ -f1)")" \
 		"$(json_str "$STORAGE")" "$(json_bool "$BACKUP")" "$(json_str "$COMPRESS")" "$FLUSH_MIN" "$(json_num "$(cat "$RUN_DIR/next" 2>/dev/null)")"
 	printf '"clock_set":%s,"net_password_set":%s,"net_mounted":%s,"spool_kb":%s,"dropped":%s,' \
 		"$(time_synced && echo true || echo false)" "$( [ -n "$(net_password)" ] && echo true || echo false)" \
@@ -1037,8 +1055,8 @@ do_status() {
 		"$(json_str "$(sed -En 's/^(dns|syslog|fw_[A-Za-z0-9_-]*)=.*/\1/p' "$(APPLIED_FILE)" 2>/dev/null | tr '\n' ' ')")"
 	printf '"sources":['
 	for s in $SOURCES; do
-		printf '%s{"id":"%s","on":%s,"days":%s,"level":%s}' "$sep" "$s" "$(src_on "$s" && echo true || echo false)" "$(src_days "$s")" \
-			"$(has_level "$s" && json_str "$(src_level "$s")" || echo null)"
+		printf '%s{"id":"%s","on":%s,"days":%s,"level":%s,"missing":%s}' "$sep" "$s" "$(src_on "$s" && echo true || echo false)" "$(src_days "$s")" \
+			"$(has_level "$s" && json_str "$(src_level "$s")" || echo null)" "$(json_str "$(source_missing "$s")")"
 		sep=','
 	done
 	printf '],"collectors":{"logread":%s,"conn":%s},' \

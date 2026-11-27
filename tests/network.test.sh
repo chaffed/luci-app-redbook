@@ -51,7 +51,9 @@ uci commit redbook
 start-stop-daemon -S -b -x /usr/bin/redbook -- daemon
 sleep 3
 TODAY=$(date +%Y-%m-%d)
-B=/var/run/redbook/net/routers/redbook/rbnet
+F=$(redbook status | jsonfilter -e @.folder)
+B=/var/run/redbook/net/routers/$F
+U=/mnt/usb/$F
 
 printf '%s\n' 'wrong password' | redbook set-secret >/dev/null
 check "[ \"\$(redbook test-network | jsonfilter -e @.reason)\" = login_refused ]" "a wrong password: the server refused the login"
@@ -66,25 +68,25 @@ check "[ \"\$(redbook test-network | jsonfilter -e @.ok)\" = true ]" "the right 
 logger -p user.notice "rbnet-line-1"
 sleep 1
 redbook flush >/dev/null 2>&1
-check "grep -q rbnet-line-1 /mnt/usb/redbook/rbnet/system/$TODAY.log" "the drive gets the lines"
+check "grep -q rbnet-line-1 $U/system/$TODAY.log" "the drive gets the lines"
 check "[ \"\$(redbook status | jsonfilter -e @.storage.backup.state)\" = ok ]" "status: the copy is ok"
-check "cmp /mnt/usb/redbook/rbnet/system/$TODAY.log $B/system/$TODAY.log" "the copy on the share matches the drive"
+check "cmp $U/system/$TODAY.log $B/system/$TODAY.log" "the copy on the share matches the drive"
 logger -p user.notice "rbnet-line-2"
 sleep 1
 redbook flush >/dev/null 2>&1
-check "cmp /mnt/usb/redbook/rbnet/system/$TODAY.log $B/system/$TODAY.log && grep -q rbnet-line-2 $B/system/$TODAY.log" "today's file is topped up on the share as it grows"
+check "cmp $U/system/$TODAY.log $B/system/$TODAY.log && grep -q rbnet-line-2 $B/system/$TODAY.log" "today's file is topped up on the share as it grows"
 YDAY=$(date -d "@$(( $(date +%s) - 86400 ))" +%Y-%m-%d)
-echo "yesterday" > /mnt/usb/redbook/rbnet/system/$YDAY.log
-cp /mnt/usb/redbook/rbnet/system/$YDAY.log $B/system/$YDAY.log
+echo "yesterday" > $U/system/$YDAY.log
+cp $U/system/$YDAY.log $B/system/$YDAY.log
 redbook flush >/dev/null 2>&1
-check "[ -s $B/system/$YDAY.log.gz ] && [ ! -e $B/system/$YDAY.log ] && cmp $B/system/SHA256SUMS /mnt/usb/redbook/rbnet/system/SHA256SUMS" "a finished day: the share gets the compressed file and its sum, the plain copy goes"
+check "[ -s $B/system/$YDAY.log.gz ] && [ ! -e $B/system/$YDAY.log ] && cmp $B/system/SHA256SUMS $U/system/SHA256SUMS" "a finished day: the share gets the compressed file and its sum, the plain copy goes"
 
 # The share as the only storage.
 uci set redbook.main.storage=network; uci commit redbook
 logger -p user.notice "rbnet-direct"
 sleep 1
 redbook flush >/dev/null 2>&1
-check "grep -q rbnet-direct $B/system/$TODAY.log && ! grep -q rbnet-direct /mnt/usb/redbook/rbnet/system/$TODAY.log" "storage on the share: lines go straight there"
+check "grep -q rbnet-direct $B/system/$TODAY.log && ! grep -q rbnet-direct $U/system/$TODAY.log" "storage on the share: lines go straight there"
 check "[ \"\$(redbook status | jsonfilter -e @.storage.state)\" = ok ] && [ \"\$(redbook status | jsonfilter -e @.storage.kind)\" = network ]" "status: writing to the network folder"
 
 # The password stays secret.
@@ -109,8 +111,8 @@ docker unpause "$SMB" >/dev/null
 sleep 2
 docker exec "$NAME" sh -c 'redbook flush >/dev/null 2>&1' || true
 docker exec "$NAME" sh -c 'redbook flush >/dev/null 2>&1' || true
-if smb "grep -q rbnet-while-down /share/routers/redbook/rbnet/system/$(date +%Y-%m-%d).log"; then ok "server back: the waiting lines arrive"; else bad "server back: the waiting lines did not arrive"; fi
-if smb "grep -q rbnet-line-2 /share/routers/redbook/rbnet/system/$(date +%Y-%m-%d).log"; then ok "the Samba server itself holds the files"; else bad "the files are not on the Samba server"; fi
+if smb "grep -q rbnet-while-down /share/routers/redbook/rbnet-*/system/$(date +%Y-%m-%d).log"; then ok "server back: the waiting lines arrive"; else bad "server back: the waiting lines did not arrive"; fi
+if smb "grep -q rbnet-line-2 /share/routers/redbook/rbnet-*/system/$(date +%Y-%m-%d).log"; then ok "the Samba server itself holds the files"; else bad "the files are not on the Samba server"; fi
 
 [ "$fail" = 0 ] && echo && echo "all checks passed"
 [ "$fail" = 0 ] || { echo; echo "$fail check(s) failed"; exit 1; }
