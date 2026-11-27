@@ -191,6 +191,16 @@ async function waitFor(fn, ms) {
 		ok(uciGet('redbook.main.net_server') === '192.0.2.21', 'GL panel: Settings saves the network folder');
 		ok(uciGet('redbook_auth.main.net_password') === SECRET + '2', 'GL panel: Settings saves the password, quoting characters and all');
 		ok(router('cat /tmp/gl-rpc-spawn.log 2>/dev/null').indexOf('cr,e') < 0, 'GL panel: the password was never a command argument');
+		/* On GL firmware, no NFS install: a note says why. */
+		router('echo 4.10.1 > /etc/glversion');
+		/* Settings again: it redraws with a fresh status (wait for the note,
+		   or this looks at the old page before the redraw). */
+		await frame.click('button[data-page=settings]');
+		await frame.waitForSelector('text=GL\'s own NFS kernel modules crashed', { state: 'attached', timeout: 15000 });
+		await frame.check('#app-f-backup');
+		ok(!(await frame.isVisible('text=Install NFS support')) && await frame.isVisible('text=GL\'s own NFS kernel modules crashed'), 'GL panel: on GL firmware NFS is not offered for install, and the page says why');
+		router('rm -f /etc/glversion');
+		await frame.uncheck('#app-f-backup');
 		await page.screenshot({ path: path.join(SHOTS, 'gl-settings.png'), fullPage: true });
 		await page.goto(WEB + '/gl/panel.html?theme=dark');
 		await sleep(2500);

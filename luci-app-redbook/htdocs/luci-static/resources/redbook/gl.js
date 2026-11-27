@@ -320,14 +320,15 @@
 						out.textContent = r && r.ok ? _('Mounted %s and wrote a test file.').format(r.path) : app.reasonText(r && r.reason);
 					}).catch(function(e) { out.textContent = e.message; }).finally(function() { ev.target.disabled = false; resize(); });
 				} }, [ _('Test the saved settings') ])
-			].concat([ [ 'smb', _('SMB') ], [ 'nfs', _('NFS') ] ].filter(function(t) { return !support[t[0]]; }).map(function(t) {
+			].concat([ [ 'smb', _('SMB') ], [ 'nfs', _('NFS') ] ].filter(function(t) { return !support[t[0]] && !(t[0] === 'nfs' && support.nfs_installable === false); }).map(function(t) {
 				return E('button', { 'class': 'app-btn app-btn-plain', type: 'button', 'click': function(ev) {
 					ev.target.disabled = true;
 					call('install_support', { type: t[0] }).then(function() {
 						out.textContent = _('Installing support for %s from the router\'s package source. This takes a minute; open Settings again afterwards.').format(t[1]);
 					}).catch(function(e) { out.textContent = e.message; ev.target.disabled = false; });
 				} }, [ _('Install %s support').format(t[1]) ]);
-			})).concat([ E('div', { 'class': 'app-desc' }, [ _('Save first: the test uses the saved settings.') ]), out ])));
+			})).concat([ !support.nfs && support.nfs_installable === false ? E('div', { 'class': 'app-desc' }, [ app.reasonText('nfs_not_on_gl') ]) : '',
+				E('div', { 'class': 'app-desc' }, [ _('Save first: the test uses the saved settings.') ]), out ])));
 
 			var form = E('form', { 'class': 'app-card' }, app.TABS.map(function(t) {
 				var box = E('fieldset', { 'class': 'app-group' }, [ E('legend', {}, [ t[1] ]) ].concat(

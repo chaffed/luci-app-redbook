@@ -161,6 +161,7 @@ var REASONS = {
 	waiting_clock: _('Waiting for the router\'s clock to be set from the internet, so that lines get the right day.'),
 	not_set: _('The network folder is not set up yet (server and share).'),
 	no_support: _('The router cannot use this kind of network folder yet: install support for it below.'),
+	nfs_not_on_gl: _('This router has no NFS support, and Red Book does not install it on GL.iNet firmware: GL\'s own NFS kernel modules crashed a GL-BE9300 as they loaded. Use an SMB folder instead.'),
 	login_refused: _('The server refused the user name or password.'),
 	share_not_found: _('The server has no share or export by that name.'),
 	unreachable: _('The server cannot be reached.'),

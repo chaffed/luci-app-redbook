@@ -104,7 +104,8 @@ return view.extend({
 				}).catch(function(e) { out.replaceChildren(String(e.message || e)); });
 			}) }, [ _('Test the saved settings') ]);
 			var support = st.support || {};
-			var missing = [ [ 'smb', _('SMB') ], [ 'nfs', _('NFS') ] ].filter(function(t) { return !support[t[0]]; });
+			var missing = [ [ 'smb', _('SMB') ], [ 'nfs', _('NFS') ] ].filter(function(t) { return !support[t[0]] && !(t[0] === 'nfs' && support.nfs_installable === false); });
+			var nfsNote = !support.nfs && support.nfs_installable === false ? E('p', { 'class': 'cbi-value-description' }, [ app.reasonText('nfs_not_on_gl') ]) : '';
 			var installs = missing.map(function(t) {
 				return E('button', { 'class': 'cbi-button', 'style': 'margin-left:.5em', 'click': ui.createHandlerFn(this, function() {
 					return app.callInstallSupport(t[0]).then(function() {
@@ -116,6 +117,7 @@ return view.extend({
 				test
 			].concat(installs).concat([
 				support.installing ? E('p', {}, [ _('Installing support…') ]) : '',
+				nfsNote,
 				E('p', { 'class': 'cbi-value-description' }, [ _('Save first: the test uses the saved settings.') ]),
 				out
 			]));
