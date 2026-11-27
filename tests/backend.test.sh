@@ -60,7 +60,7 @@ Fri Nov 27 08:04:42 2026 [1795795482.000] daemon.info dnsmasq-dhcp[28302]: DHCPA
 Sun Nov  1 01:00:00 2026 [1795795483.000] user.notice x: a single-digit day
 Wed Oct 21 01:00:00 2026 [1795795484.000] user.notice x: dated before the router started
 LINES
-	run() { awk -v spool="$SPOOL" -v statef=$T/last -v bootday=2026-11-01 -v slevel="$1" -v klevel=6 -v dns="$2" -v fw=1 "$LOGREAD_AWK" < $T/in; }
+	run() { awk -v spool="$SPOOL" -v statef=$T/last -v bootday=2026-11-01 -v slevel="$1" -v klevel=6 -v dns="$2" -v fw="${3:-1}" "$LOGREAD_AWK" < $T/in; }
 	run 6 1
 	cat $SPOOL/system/*.cur > $T/system; cat $SPOOL/kernel/*.cur > $T/kernel
 	cat $SPOOL/firewall/*.cur > $T/firewall; cat $SPOOL/dns/*.cur > $T/dns
@@ -75,6 +75,9 @@ LINES
 	rm -rf $SPOOL $T/last; spool_dirs
 	run -1 0
 	cat $SPOOL/system/*.cur > $T/system_off 2>/dev/null
+	rm -rf $SPOOL $T/last; spool_dirs
+	run 6 0 0
+	cat $SPOOL/kernel/*.cur > $T/kernel_nofw 2>/dev/null
 	true
 )
 check "grep -q 'dropbear\[4295\]: Child connection' $T/system && ! grep -q 'debug noise' $T/system" "system log: info kept, debug left out at level info"
@@ -88,6 +91,7 @@ check "grep -q 'before the router started' $T/nov01 && grep -q 'single-digit day
 check "[ \$(cat $T/after) = \$(cat $T/before) ] && [ \$(cat $T/before) = 7 ]" "a restarted collector adds no duplicates"
 check "! grep -q 'query\[' $T/system_nodns" "DNS off: query lines are dropped, not put in the system log"
 check "[ ! -s $T/system_off ]" "system log off: nothing is kept"
+check "grep -q 'DROP(src wan)' $T/kernel_nofw" "firewall log off: packet lines stay in the kernel log (GL logs SYN floods that way)"
 
 # ----------------------------------------------------------- mesh, web
 (
@@ -100,6 +104,9 @@ ERROR 23:59:12:052 <beerocks_agent> son_slave_thread.cpp[1125] --> before midnig
 INFO 00:01:00:000 <beerocks_agent> x.cpp[1] --> info after midnight
 ERROR 00:02:00:500 <beerocks_agent> y.cpp[2] --> after midnight
   continuation of the error
+ERROR 00:02:01:000 <beerocks_agent> y.cpp[2] --> after midnight
+  continuation of the error
+ERROR 00:03:07:250 <beerocks_agent> y.cpp[2] --> after midnight
 M
 	echo "INFO 00:05:00:000 <x> still being written" > $MESH_DIR/beerocks_agent.20261128_000506.log
 	ln -s beerocks_agent.20261128_000506.log $MESH_DIR/beerocks_agent.log
@@ -115,7 +122,8 @@ M
 	cat $SPOOL/web/*.cur > $T/web2
 )
 check "[ \$(wc -l < $T/mesh27) = 1 ] && grep -q '^2026-11-27 23:59:12.052 beerocks_agent ERROR <beerocks_agent> son_slave_thread.cpp\[1125\] --> before midnight' $T/mesh27" "mesh: kept at level warning, with the day and part name added"
-check "grep -q '^2026-11-28 00:02:00.500 beerocks_agent ERROR' $T/mesh28 && grep -q 'continuation of the error' $T/mesh28 && ! grep -q 'info after' $T/mesh28" "mesh: past midnight the next day is used; continuation lines follow their message"
+check "grep -q '^2026-11-28 00:02:00.500 beerocks_agent ERROR' $T/mesh28 && [ \$(grep -c 'continuation of the error' $T/mesh28) = 1 ] && ! grep -q 'info after' $T/mesh28" "mesh: past midnight the next day is used; continuation lines follow their message"
+check "[ \$(grep -c 'after midnight' $T/mesh28) = 2 ] && grep -q '^2026-11-28 00:03:07.250 beerocks_agent redbook: repeated 2 more times in this file, the last at 00:03:07.250: ERROR <beerocks_agent> y.cpp\[2\] --> after midnight' $T/mesh28" "mesh: a repeated message is kept once, with a count and the time of the last"
 check "! grep -q 'still being written' $T/mesh27 $T/mesh28 && [ \$(wc -l < $T/mesh27) = 1 ]" "mesh: the file still being written waits; a file is read once"
 check "grep -q 'first error' $T/web1 && ! grep -q chatter $T/web1 && ! grep -q 'half a li' $T/web1" "web server: errors kept at level warn; a half-written line waits"
 check "grep -q 'half a line' $T/web2 && [ \$(grep -c 'first error' $T/web2) = 1 ]" "web server: the line is taken whole once finished, and nothing twice"

@@ -499,7 +499,8 @@ prune_all() { local s; for s in $SOURCES; do prune_dir "$1/$s" "$(src_days "$s")
 # source and day. -t adds the exact time of each line ([epoch.ms]), which
 # is how a restart of the collector skips lines it already has; it is taken
 # out again before the line is stored, so files hold what logread shows.
-# Firewall lines are kernel lines with IN= and OUT=; dnsmasq's own query
+# Firewall lines are kernel lines with IN= and OUT= (in the kernel log while
+# the firewall log is off); dnsmasq's own query
 # lines (query, forwarded, reply, cached...) never go to the system log,
 # only query lines to "dns", and only while that source is on.
 LOGREAD_AWK='
@@ -525,7 +526,9 @@ $6 ~ /^\[[0-9]+(\.[0-9]+)?\]$/ {
 	p = (fl[2] in lv) ? lv[fl[2]] : 6
 	src = ""
 	if (fl[1] == "kern") {
-		if (line ~ /IN=[^ ]* OUT=/) { if (fw) src = "firewall" }
+		# Packet log lines (IN= OUT=) have a log of their own while that is
+		# on; otherwise they stay in the kernel log (GL logs SYN floods so).
+		if (fw && line ~ /IN=[^ ]* OUT=/) src = "firewall"
 		else if (p <= klevel) src = "kernel"
 	} else if ($8 ~ /^dnsmasq(\[[0-9]+\])?:$/ && line ~ /dnsmasq(\[[0-9]+\])?: ([0-9]+ [^ ]+ )?(query|forwarded|reply|cached|config|validation|answer|dnssec|ipset|nftset|exceeded|NODATA)/) {
 		if (dns && line ~ /dnsmasq(\[[0-9]+\])?: ([0-9]+ [^ ]+ )?query\[/) src = "dns"
@@ -546,11 +549,15 @@ CONN_AWK='
 # A finished mesh log (beerocks_<part>.YYYYMMDD_HHMMSS.log). Its lines carry
 # only the time ("INFO 07:57:12:052 <thread> file.cpp[59] --> text"): the
 # day comes from the file name, plus one when the time wraps past midnight.
+# GL firmware 4.10 repeats a few errors several times a second (about 110
+# MB a day at "warning"): each message is kept the first time it appears in
+# a file, and a line at the end says how many more times it came, and when
+# it last did.
 MESH_AWK='
 BEGIN {
 	lv["DEBUG"] = 7; lv["TRACE"] = 7; lv["INFO"] = 6; lv["WARNING"] = 4; lv["WARN"] = 4; lv["ERROR"] = 3; lv["FATAL"] = 2
 	daystart = mktime(substr(start, 1, 4) " " substr(start, 5, 2) " " substr(start, 7, 2) " 00 00 00")
-	prev = -1; keep = 0
+	prev = -1; keep = 0; n = 0
 }
 ($1 in lv) && $2 ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]:[0-9]+$/ {
 	split($2, t, ":"); s = t[1] * 3600 + t[2] * 60 + t[3]
@@ -560,11 +567,23 @@ BEGIN {
 	if (!keep) next
 	d = strftime("%Y-%m-%d", daystart + 43200)
 	rest = $0; sub(/^[A-Z]+ [0-9:]+ /, "", rest)
+	when = d " " t[1] ":" t[2] ":" t[3] "." t[4]
+	key = $1 " " rest
+	if (key in seen) { rep[key]++; lastw[key] = when; lastd[key] = d; keep = 0; next }
+	seen[key] = 1; order[++n] = key
 	f = spool "/mesh/" d ".cur"
-	print d " " t[1] ":" t[2] ":" t[3] "." t[4] " " comp " " $1 " " rest >> f; close(f)
+	print when " " comp " " $1 " " rest >> f; close(f)
 	next
 }
-keep && f != "" { print "    " $0 >> f; close(f) }'
+keep && f != "" { print "    " $0 >> f; close(f) }
+END {
+	for (i = 1; i <= n; i++) {
+		k = order[i]
+		if (!rep[k]) continue
+		f = spool "/mesh/" lastd[k] ".cur"
+		print lastw[k] " " comp " redbook: repeated " rep[k] " more times in this file, the last at " substr(lastw[k], 12) ": " k >> f; close(f)
+	}
+}'
 
 # nginx error.log lines: "2026/11/27 07:21:00 [error] 1234#0: ...".
 WEB_AWK='
@@ -631,7 +650,7 @@ collect_health() {
 	done
 	ct=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)
 	awk -v up="$up" -v temp="$temp" -v ct="$ct" -v now="$(stamp)" '
-		FILENAME == "/proc/loadavg" { load = $1 "," $2 "," $3; procs = $4 }
+		FILENAME == "/proc/loadavg" { load = $1 "," $2 "," $3; procs = $4; sub(/.*\//, "", procs) }
 		FILENAME == "/proc/meminfo" && $1 == "MemAvailable:" { avail = $2 }
 		FILENAME == "/proc/meminfo" && $1 == "MemFree:" { free = $2 }
 		END {

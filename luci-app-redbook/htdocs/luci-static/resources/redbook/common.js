@@ -42,7 +42,7 @@ var SOURCES = [
 	{ id: 'web', label: _('Web server errors'), on: true, level: 'warn', days: 90,
 	  desc: _('Errors from the web server behind the admin panel and LuCI, such as failed logins and broken requests.') },
 	{ id: 'mesh', label: _('Mesh logs'), on: false, level: 'warn', days: 30,
-	  desc: _('The mesh controller and agent. At "info" or "debug" these are very large (about 170 MB a day before compression).') },
+	  desc: _('The mesh controller and agent. GL firmware repeats a few errors several times a second: each message is kept once per 10 minutes, with a count of its repeats. Even so, expect a few MB a day.') },
 	{ id: 'dns', label: _('DNS queries'), on: false, days: 30, privacy: true,
 	  desc: _('Every name each device looks up. While this is on, Red Book turns on query logging in dnsmasq; the router\'s own log in memory then holds fewer hours.') },
 	{ id: 'firewall', label: _('Firewall blocks'), on: false, days: 30, privacy: true,
