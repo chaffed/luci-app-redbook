@@ -16,6 +16,7 @@ Red Book: keeps the router's logs on a USB drive or a network folder (SMB, NFS),
 
 ## Facts learned the hard way
 
+- **Many log lines share a millisecond**: a quarter of the GL-BE9300's buffer did. A restarted collector cannot skip by time alone (`e <= last` dropped over 1,000 of 4,064 lines): `logread.last` holds the newest stamp and every line kept with it, and only those copies are skipped.
 - `logread -f` prints **no backlog**; `logread -f -l N` prints the last N lines, then follows. `-t` adds `[epoch.ms]` after the date, which is how a restarted collector skips lines it already has (`/var/run/redbook/logread.last`). The stamp is removed before storing.
 - The shell starts the collectors as `/sbin/logread`, `/usr/sbin/conntrack` (that is their cmdline): match on `*"logread -f -t -l "*`, not `"logread …"*`, or a restart leaves an orphan reader and starts no new one.
 - On OpenWrt `/var` is a link to `/tmp`: `/proc/mounts` lists the network mount as `/tmp/run/redbook/net`. Compare against `pwd -P` of the mount point.
