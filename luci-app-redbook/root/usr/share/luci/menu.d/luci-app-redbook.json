@@ -1,0 +1,18 @@
+{
+	"admin/services/redbook": {
+		"title": "Red Book",
+		"order": 60,
+		"action": { "type": "alias", "path": "admin/services/redbook/overview" },
+		"depends": { "acl": [ "luci-app-redbook" ], "uci": { "redbook": true } }
+	},
+	"admin/services/redbook/overview": {
+		"title": "Overview",
+		"order": 1,
+		"action": { "type": "view", "path": "redbook/overview" }
+	},
+	"admin/services/redbook/settings": {
+		"title": "Settings",
+		"order": 2,
+		"action": { "type": "view", "path": "redbook/settings" }
+	}
+}

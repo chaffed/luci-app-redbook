@@ -1,0 +1,17 @@
+{
+	"luci-app-redbook": {
+		"description": "Grant access to Red Book",
+		"read": {
+			"ubus": {
+				"luci.redbook": [ "status", "data" ]
+			},
+			"uci": [ "redbook" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.redbook": [ "check", "set_secret", "clear" ]
+			},
+			"uci": [ "redbook" ]
+		}
+	}
+}
