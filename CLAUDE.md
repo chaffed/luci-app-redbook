@@ -28,3 +28,17 @@ Red Book: keeps the router's logs on a USB drive or a network folder (SMB, NFS),
 - GL mesh logs (`/tmp/beerocks/logs`) rotate every 10 minutes and keep 3 files; about 170 MB a day at info level on a GL-BE9300. Lines carry only the time; the day comes from the file name.
 - dnsmasq with `logqueries=1` writes several lines per lookup into logd's 512 KB buffer: only `query[` lines are kept, and none go to the system log.
 - Test rigs: an OpenWrt container run `--privileged` (needed to mount) loses its network to OpenWrt's own boot, so `tests/openwrt-net` does not boot and starts only ubusd and logd. In a non-privileged container dnsmasq crash-loops (it cannot make its jail).
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues on chaffed/luci-app-redbook, through `gh` (the repository is not created yet). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five default labels: needs-triage, needs-info, ready-for-agent, ready-for-human, wontfix. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
