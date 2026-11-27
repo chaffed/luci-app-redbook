@@ -26,6 +26,8 @@ Red Book: keeps the router's logs on a USB drive or a network folder (SMB, NFS),
 - An init script can hang (dnsmasq's did, in a container): other services are reloaded in the background (`reload_bg`) so the logs keep being kept.
 - The GL panel and `uci commit` don't tell procd about a settings change; the daemon compares a checksum of `uci show redbook` every loop and starts again in place (`exec`).
 - GL mesh logs (`/tmp/beerocks/logs`) rotate every 10 minutes and keep 3 files. Lines carry only the time; the day comes from the file name. Firmware 4.10 repeats a few errors several times a second: about 110 MB a day even at "warning" (measured on the mesh node), so exact repeats are kept once per file with a count (1.56 MB → 23 KB).
+- GL firmware puts the old nginx error log (`/tmp/log/nginx/error.log`, in RAM) back after a restart, with lines weeks old. A read position kept in RAM re-reads it all: the newest stored line and the lines of that second are kept in `<storage>/.state/web.last` instead. Seen on the mesh node's first reboot test.
+- GL 4.10 runs fw4 (nftables): look for `log prefix` with `nft list ruleset`, not iptables. GL's own SYN_FLOOD and ICMP rules log packets, which is why packet lines stay in the kernel log while the firewall log is off.
 - dnsmasq with `logqueries=1` writes several lines per lookup into logd's 512 KB buffer: only `query[` lines are kept, and none go to the system log.
 - Test rigs: an OpenWrt container run `--privileged` (needed to mount) loses its network to OpenWrt's own boot, so `tests/openwrt-net` does not boot and starts only ubusd and logd. In a non-privileged container dnsmasq crash-loops (it cannot make its jail).
 
