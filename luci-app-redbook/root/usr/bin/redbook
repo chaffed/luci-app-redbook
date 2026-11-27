@@ -521,6 +521,7 @@ BEGIN {
 $6 ~ /^\[[0-9]+(\.[0-9]+)?\]$/ {
 	e = substr($6, 2, length($6) - 2) + 0
 	if (e < last) next
+	if (e == last && n == 0) next   # a stamp without its lines (0.1.0-r4 and before)
 	if (e == last && have[$0] > 0) { have[$0]--; next }
 	if (e > last) { last = e; n = 0; for (k in have) delete have[k] }
 	cur[++n] = $0

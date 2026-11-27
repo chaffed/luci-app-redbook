@@ -95,10 +95,16 @@ Fri Nov 27 08:05:00 2026 [1795795500.002] user.notice x: same-ms d
 LINES
 	run 6 0
 	cat $SPOOL/system/*.cur > $T/samems2
+	# A state file from before, with the stamp alone.
+	rm -rf $SPOOL; spool_dirs
+	echo 1795795500.001 > $T/last
+	run 6 0
+	cat $SPOOL/system/*.cur > $T/oldstate
 	true
 )
 check "[ \$(grep -c 'same-ms a' $T/samems1) = 1 ] && [ \$(grep -c 'same-ms b' $T/samems1) = 2 ]" "lines in the same millisecond are all kept, identical ones too"
 check "[ \$(wc -l < $T/samems2) = 5 ] && [ \$(grep -c 'same-ms b' $T/samems2) = 2 ] && grep -q 'same-ms c' $T/samems2 && grep -q 'same-ms d' $T/samems2" "after a restart: lines of that millisecond not yet kept are added, nothing twice"
+check "[ \$(wc -l < $T/oldstate) = 1 ] && grep -q 'same-ms d' $T/oldstate" "a state file holding only the time (an earlier version's) adds no duplicates"
 check "grep -q 'dropbear\[4295\]: Child connection' $T/system && ! grep -q 'debug noise' $T/system" "system log: info kept, debug left out at level info"
 check "! grep -q '\[1795795477.166\]' $T/system && grep -q '^Fri Nov 27 08:04:37 2026 authpriv.info dropbear' $T/system" "system log: stored as logread shows it, without the extra time stamp"
 check "grep -q 'DROP(src wan)' $T/firewall && ! grep -q DROP $T/kernel && ! grep -q DROP $T/system" "firewall blocks go to their own log, not the kernel log"
