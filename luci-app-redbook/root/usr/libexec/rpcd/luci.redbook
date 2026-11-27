@@ -1,39 +1,50 @@
 #!/bin/sh
 # rpcd plugin exposing Red Book to LuCI as ubus object "luci.redbook".
-# Input arrives as JSON on stdin. Secrets are handed on through stdin or
-# the environment, never the command line, which any process can read.
+# Input arrives as JSON on stdin. The network folder's password is handed
+# on through stdin, never the command line, which any process can read.
+# Anything slow (writing now, installing packages) runs detached, so rpcd
+# never waits on it.
 # shellcheck shell=dash disable=SC1091,SC2154
 
 . /usr/share/libubox/jshn.sh
 
 case "$1" in
 	list)
-		echo '{"status":{},"data":{"since":0,"until":0},"check":{},"set_secret":{"secret":"str"},"clear":{}}'
+		echo '{"status":{},"lines":{"source":"str","count":0,"filter":"str"},"drives":{},"flush":{},"test_network":{},"install_support":{"type":"str"},"set_secret":{"secret":"str"}}'
 		;;
 	call)
 		case "$2" in
 			status)
 				/usr/bin/redbook status
 				;;
-			data)
+			lines)
 				read -r input
 				json_load "$input"
-				json_get_var since since
-				json_get_var until until
-				/usr/bin/redbook data "${since:-0}" "${until:-}"
+				json_get_var source source
+				json_get_var count count
+				json_get_var filter filter
+				/usr/bin/redbook lines "$source" "${count:-100}" "$filter"
 				;;
-			check)
-				/usr/bin/redbook check >/dev/null 2>&1
-				/usr/bin/redbook status
+			drives)
+				/usr/bin/redbook drives
+				;;
+			flush)
+				/usr/bin/redbook flush-bg
+				;;
+			test_network)
+				/usr/bin/redbook test-network
+				;;
+			install_support)
+				read -r input
+				json_load "$input"
+				json_get_var type type
+				/usr/bin/redbook install-support "$type"
 				;;
 			set_secret)
 				read -r input
 				json_load "$input"
 				json_get_var secret secret
 				printf '%s\n' "$secret" | /usr/bin/redbook set-secret
-				;;
-			clear)
-				/usr/bin/redbook clear
 				;;
 		esac
 		;;

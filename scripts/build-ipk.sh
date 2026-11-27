@@ -45,7 +45,7 @@ License: MIT
 Section: luci
 Architecture: all
 Installed-Size: $((SIZE * 1024))
-Description: Red Book - Keeps the router's logs on a USB drive or network folder for troubleshooting and security analysis.
+Description: Red Book - keeps the router's logs on a USB drive or a network folder, for troubleshooting and security analysis.
 CTRL
 # Files opkg keeps (as <name>-opkg beside them) when they were changed.
 printf '/etc/config/redbook\n/etc/config/redbook_auth\n' > "$WORK/control/conffiles"
@@ -61,8 +61,12 @@ POST
 cat > "$WORK/control/prerm" <<'PRERM'
 #!/bin/sh
 [ -n "$IPKG_INSTROOT" ] && exit 0
+[ "$1" = upgrade ] && exit 0
 /etc/init.d/redbook stop 2>/dev/null
 /etc/init.d/redbook disable 2>/dev/null
+# Put back the router settings Red Book changed (DNS query logging,
+# firewall logging, the syslog server) and let go of a network folder.
+/usr/bin/redbook revert 2>/dev/null
 exit 0
 PRERM
 cat > "$WORK/control/postrm" <<'POSTRM'

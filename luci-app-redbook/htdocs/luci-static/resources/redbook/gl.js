@@ -137,9 +137,10 @@
 	}
 
 	/* The views call the rpcd object luci.redbook; the panel module has the
-	 * same methods, two under names the panel does not write to its log. */
-	var METHODS = { status: 'get_status', data: 'get_data' };
-	var SECONDS = { check: 100, data: 70 };
+	 * same methods, the ones the pages call often under names the panel
+	 * does not write to its log ("get"). */
+	var METHODS = { status: 'get_status', lines: 'get_lines', drives: 'get_drives' };
+	var SECONDS = { lines: 70, test_network: 70 };
 	var rpc = {
 		declare: function(o) {
 			var names = o.params || [];
@@ -230,65 +231,136 @@
 		'background:var(--background-card);color:var(--text-regular);min-width:240px}.app-field-error{color:var(--error);font-size:12px}',
 		'.app-note{padding:8px 12px;border-radius:4px;margin-bottom:8px;background:var(--background-content)}.app-note.warning{color:var(--error)}',
 		'#app-modal{position:fixed;inset:0;background:rgba(0,0,0,.3);display:flex;align-items:center;justify-content:center}#app-modal[hidden]{display:none}',
-		'.app-modal-box{background:var(--background-card);padding:16px 20px;border-radius:8px;max-width:480px}'
+		'.app-modal-box{background:var(--background-card);padding:16px 20px;border-radius:8px;max-width:480px}',
+		'.app-group{border:1px solid var(--divider);border-radius:6px;margin:0 0 16px;padding:8px 16px 12px}.app-group legend{font-weight:600;color:var(--text-title);padding:0 6px}',
+		'.app-row{margin:10px 0}.app-row[hidden]{display:none}.app-sub{margin-left:24px}.app-desc{color:var(--text-hint);font-size:12px;margin-top:3px;max-width:640px}',
+		'.app-check{display:flex;align-items:center;gap:6px;margin:0}.app-check input{min-width:0}.app-btn-plain{margin-left:8px;background:var(--background-content)!important;color:var(--text-regular)!important}',
+		'.app-pre,pre{white-space:pre-wrap;word-break:break-all;font-size:12px;background:var(--background-content);padding:8px;border-radius:4px;max-height:420px;overflow:auto}',
+		'.redbook-warn{color:var(--error)}.redbook-ok{color:var(--text-regular)}.redbook-info{color:var(--text-regular)}',
+		'@media (max-width:600px){input,select{min-width:0;width:100%;box-sizing:border-box}.app-sub{margin-left:12px}}'
 	].join('');
 
 	/* ----------------------------------------------------------- settings -- */
 
-	/* Every setting the panel's form offers. Keep in step with LuCI's
-	 * settings.js and FIELDS in the panel module (tests/settings.test.js). */
-	function sections() {
-		return [
-			{ key: 'enabled', type: 'flag', label: _('Check on a schedule') },
-			{ key: 'interval', type: 'select', label: _('Check every'), options: [ [ '1', _('1 minute') ], [ '5', _('5 minutes') ], [ '15', _('15 minutes') ], [ '60', _('60 minutes') ] ] },
-			{ key: 'target', type: 'text', label: _('Host to check'), placeholder: '1.1.1.1' },
-			{ key: 'history_days', type: 'text', label: _('Keep history for (days)'), placeholder: '90' },
-			{ key: 'secret', type: 'password', label: _('Secret') }
-		];
-	}
-
+	/* The panel's own Settings form, drawn from the schema in common.js,
+	 * which LuCI's settings.js is drawn from too. Values go to set_config
+	 * (checked again by FIELDS in the panel module), the password to
+	 * set_secret; a saved password is never loaded into the page. */
 	function renderSettings(page) {
-		return Promise.all([ call('get_config'), call('get_status') ]).then(function(got) {
-			var cfg = (got[0] && !Array.isArray(got[0].config) && got[0].config) || {}, st = got[1] || {};
-			var inputs = {}, errors = {};
-			var form = E('form', { 'class': 'app-card' }, sections().map(function(f) {
-				var el;
+		return Promise.all([ requireModule(APP + '.common'), call('get_config'), call('get_status'),
+			call('get_drives').catch(function() { return {}; }) ]).then(function(got) {
+			var app = got[0], cfg = (got[1] && !Array.isArray(got[1].config) && got[1].config) || {}, st = got[2] || {};
+			var drives = (got[3] && got[3].drives) || [];
+			var fields = app.schema(), values = {}, inputs = {}, errors = {}, rows = {};
+			fields.forEach(function(f) {
+				if (f.type !== 'password') values[f.key] = cfg[f.key] != null ? cfg[f.key] : (f.def != null ? f.def : '');
+			});
+
+			function read() {
+				fields.forEach(function(f) {
+					if (f.type === 'password') return;
+					values[f.key] = f.type === 'flag' ? (inputs[f.key].checked ? '1' : '0') : inputs[f.key].value.trim();
+				});
+			}
+
+			var netBox = E('div', { 'class': 'app-row' }), configsBox = E('div', { 'class': 'app-row' });
+
+			function update() {
+				read();
+				fields.forEach(function(f) { rows[f.key].hidden = !app.shown(f, values); });
+				netBox.hidden = !(values.storage === 'network' || (values.storage === 'usb' && values.backup === '1'));
+				configsBox.hidden = values.syslog_send !== '1';
+				configsBox.replaceChildren(E('p', {}, [ _('Logs from the router arrive as below. A config for the server that receives them, saving one file per day:') ]));
+				app.syslogConfigs(st, values).forEach(function(c) {
+					configsBox.appendChild(E('div', {}, [ E('strong', {}, [ c.name ]), ' ', E('code', {}, [ c.file ]), E('pre', { 'class': 'app-pre' }, [ c.text ]) ]));
+				});
+				resize();
+			}
+
+			function field(f) {
+				var el, id = 'app-f-' + f.key;
 				if (f.type === 'flag') {
-					el = E('input', { type: 'checkbox' });
-					el.checked = (cfg[f.key] || '1') === '1';
+					el = E('input', { type: 'checkbox', id: id });
+					el.checked = values[f.key] === '1';
 				} else if (f.type === 'select') {
-					el = E('select', {}, f.options.map(function(o) { return E('option', { value: o[0] }, [ o[1] ]); }));
-					el.value = cfg[f.key] || f.options[1][0];
+					el = E('select', { id: id }, f.options.map(function(o) { return E('option', { value: o[0] }, [ o[1] ]); }));
+					el.value = values[f.key];
 				} else {
-					el = E('input', { type: f.type === 'password' ? 'password' : 'text', autocomplete: 'off',
-						placeholder: f.type === 'password' ? (st.secret_set ? _('(saved)') : '') : f.placeholder || '' });
-					/* Write-only: a saved secret is never put back in the field. */
-					el.value = f.type === 'password' ? '' : (cfg[f.key] || '');
+					el = E('input', { type: f.type === 'password' ? 'password' : 'text', id: id, autocomplete: 'off',
+						placeholder: f.type === 'password' ? (st.net_password_set ? _('(saved)') : '') : (f.placeholder || '') });
+					/* Write-only: a saved password is never put back in the field. */
+					el.value = f.type === 'password' ? '' : values[f.key];
+					if (f.key === 'usb_path' && drives.length) {
+						el.setAttribute('list', 'app-drives');
+						el = E('span', {}, [ el, E('datalist', { id: 'app-drives' }, drives.map(function(d) { return E('option', { value: d.path }, [ d.path ]); })) ]);
+					}
 				}
-				inputs[f.key] = el;
+				var input = el.tagName === 'SPAN' ? el.firstChild : el;
+				input.addEventListener('change', update);
+				inputs[f.key] = input;
 				errors[f.key] = E('div', { 'class': 'app-field-error' });
-				return E('div', {}, [ E('label', {}, [ f.label ]), el, errors[f.key] ]);
+				var desc = f.desc || '';
+				if (f.privacy) desc = desc + ' ' + app.PRIVACY;
+				if (f.type === 'password')
+					desc = st.net_password_set ? _('A password is saved. Leave empty to keep it. Saved passwords are never shown.') : _('Leave empty for a guest login.');
+				var label = E('label', { 'for': id }, [ f.label ]);
+				rows[f.key] = E('div', { 'class': 'app-row' + (f.source ? ' app-sub' : '') }, f.type === 'flag'
+					? [ E('label', { 'class': 'app-check' }, [ input, ' ', f.label ]), desc ? E('div', { 'class': 'app-desc' }, [ desc ]) : '', errors[f.key] ]
+					: [ label, el, desc ? E('div', { 'class': 'app-desc' }, [ desc ]) : '', errors[f.key] ]);
+				return rows[f.key];
+			}
+
+			var out = E('div', { 'class': 'app-desc' });
+			var support = st.support || {};
+			netBox.appendChild(E('div', {}, [
+				E('button', { 'class': 'app-btn', type: 'button', 'click': function(ev) {
+					ev.target.disabled = true;
+					out.textContent = _('Trying…');
+					call('test_network', {}, 70).then(function(r) {
+						out.textContent = r && r.ok ? _('Mounted %s and wrote a test file.').format(r.path) : app.reasonText(r && r.reason);
+					}).catch(function(e) { out.textContent = e.message; }).finally(function() { ev.target.disabled = false; resize(); });
+				} }, [ _('Test the saved settings') ])
+			].concat([ [ 'smb', _('SMB') ], [ 'nfs', _('NFS') ] ].filter(function(t) { return !support[t[0]]; }).map(function(t) {
+				return E('button', { 'class': 'app-btn app-btn-plain', type: 'button', 'click': function(ev) {
+					ev.target.disabled = true;
+					call('install_support', { type: t[0] }).then(function() {
+						out.textContent = _('Installing support for %s from the router\'s package source. This takes a minute; open Settings again afterwards.').format(t[1]);
+					}).catch(function(e) { out.textContent = e.message; ev.target.disabled = false; });
+				} }, [ _('Install %s support').format(t[1]) ]);
+			})).concat([ E('div', { 'class': 'app-desc' }, [ _('Save first: the test uses the saved settings.') ]), out ])));
+
+			var form = E('form', { 'class': 'app-card' }, app.TABS.map(function(t) {
+				var box = E('fieldset', { 'class': 'app-group' }, [ E('legend', {}, [ t[1] ]) ].concat(
+					fields.filter(function(f) { return f.tab === t[0]; }).map(field)));
+				if (t[0] === 'network') box.appendChild(netBox);
+				if (t[0] === 'syslog') box.appendChild(configsBox);
+				return box;
 			}).concat([ E('p', {}, [ E('button', { 'class': 'app-btn', type: 'submit' }, [ _('Save') ]) ]) ]));
 
 			form.addEventListener('submit', function(ev) {
 				ev.preventDefault();
-				var values = {};
+				read();
+				var bad = false, send = {};
 				Object.keys(errors).forEach(function(k) { errors[k].textContent = ''; });
-				sections().forEach(function(f) {
+				fields.forEach(function(f) {
 					if (f.type === 'password') return;
-					values[f.key] = f.type === 'flag' ? (inputs[f.key].checked ? '1' : '0') : inputs[f.key].value;
+					var r = app.shown(f, values) ? app.checkValue(f, values[f.key]) : true;
+					if (r !== true) { errors[f.key].textContent = r; bad = true; }
+					send[f.key] = values[f.key];
 				});
-				call('set_config', { values: values }).then(function() {
-					var s = inputs.secret.value;
-					return s ? call('set_secret', { secret: s }).then(function() { inputs.secret.value = ''; inputs.secret.placeholder = _('(saved)'); }) : null;
+				if (bad) { note(_('Not saved: some values need fixing.'), 'warning'); resize(); return; }
+				call('set_config', { values: send }).then(function() {
+					var s = inputs.net_password.value;
+					return s ? call('set_secret', { secret: s }).then(function() { inputs.net_password.value = ''; inputs.net_password.placeholder = _('(saved)'); }) : null;
 				}).then(function() {
-					note(_('Settings saved.'), 'info');
+					note(_('Settings saved. Red Book starts again with them within half a minute.'), 'info');
 				}).catch(function(e) {
 					if (e.field && errors[e.field]) errors[e.field].textContent = e.message;
 					note(_('Not saved: %s').format(e.message), 'warning');
 				});
 			});
 			page.replaceChildren(E('h2', {}, [ _('Settings') ]), form);
+			update();
 		});
 	}
 

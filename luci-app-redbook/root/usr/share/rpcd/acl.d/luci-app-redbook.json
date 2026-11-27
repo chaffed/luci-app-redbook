@@ -3,13 +3,13 @@
 		"description": "Grant access to Red Book",
 		"read": {
 			"ubus": {
-				"luci.redbook": [ "status", "data" ]
+				"luci.redbook": [ "status", "lines", "drives" ]
 			},
 			"uci": [ "redbook" ]
 		},
 		"write": {
 			"ubus": {
-				"luci.redbook": [ "check", "set_secret", "clear" ]
+				"luci.redbook": [ "flush", "test_network", "install_support", "set_secret" ]
 			},
 			"uci": [ "redbook" ]
 		}

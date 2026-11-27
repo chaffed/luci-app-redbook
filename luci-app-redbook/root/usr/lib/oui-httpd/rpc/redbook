@@ -6,15 +6,17 @@
     run /usr/bin/redbook without a shell (arguments are passed as a list)
     and read or write the "redbook" UCI settings. Every value is checked
     here before it is used or stored (gl-validator.d/redbook.lua turns the
-    panel's own, much stricter check off for set_config and set_secret).
+    panel's own, much stricter check off for set_config, set_secret and
+    get_lines). The backend checks every value again when it reads it.
 
     The panel's ngx.pipe gives a command arguments only (no stdin, no
-    environment), and arguments are visible to every process, so a secret
-    never travels that way: set_secret writes it with UCI directly.
+    environment), and arguments are visible to every process, so the
+    network folder's password never travels that way: set_secret writes it
+    with UCI directly.
 
     The panel writes every call to the system log unless the method's name
-    contains "get", "load" or "check"; hence get_status and get_data, which
-    the Overview calls often.
+    contains "get", "load" or "check"; hence get_status, get_lines and
+    get_drives, which the pages call often.
 
     nginx keeps this module in memory once used: the package reloads nginx
     on install so a new version takes effect.
@@ -65,44 +67,76 @@ end
 -- "%.0f", not "%d": the panel's Lua may use 32-bit integers.
 local function whole(n) return string.format("%.0f", n) end
 
+local function text(max)
+    return function(v) return #v <= max and not v:find("[%z\1-\31\127]") end
+end
+
+-- Log sources, in the order the pages show them. Keep in step with
+-- SOURCES in the backend and common.js (tests/settings.test.js checks).
+local SOURCES = { "system", "kernel", "crash", "boots", "health", "web", "mesh", "dns", "firewall", "conn" }
+local LEVELED = { system = true, kernel = true, web = true, mesh = true }
+
 --[[
     @method-name: get_status
-    @method-desc: Scheduler state and the latest reading. Says whether a secret is saved, never what it is.
+    @method-desc: Storage, backup copy, sources and the router settings Red Book changes. Says whether a password is saved, never what it is.
 --]]
 M.get_status = function()
     return run_json({ "status" })
 end
 
 --[[
-    @method-name: get_data
-    @method-desc: Stored readings of a period, as CSV text.
-    @in number since  Unix time.
-    @in number until  Unix time (default: now).
+    @method-name: get_lines
+    @method-desc: The last lines of a log source's newest day, optionally only those containing a text.
+    @in string source  One of the log sources.
+    @in number count   How many lines (1-500).
+    @in string filter  Text to look for (optional).
 --]]
-M.get_data = function(params)
-    params = params or {}
-    local args = { "data", whole(int_arg(params.since, 0, 4294967295, 0)) }
-    if params["until"] ~= nil then
-        args[#args + 1] = whole(int_arg(params["until"], 0, 4294967295, 4294967295))
+M.get_lines = function(params)
+    params = type(params) == "table" and params or {}
+    local source = params.source
+    local known = false
+    for _, s in ipairs(SOURCES) do if s == source then known = true end end
+    if not known then return { err_code = -1, err_msg = "unknown log source", field = "source" } end
+    local filter = type(params.filter) == "string" and params.filter or ""
+    if not text(64)(filter) then return { err_code = -1, err_msg = "invalid value", field = "filter" } end
+    return run_json({ "lines", source, whole(int_arg(params.count, 1, 500, 100)), filter }, 60)
+end
+
+--[[
+    @method-name: get_drives
+    @method-desc: Mounted USB drives the logs could go to.
+--]]
+M.get_drives = function()
+    return run_json({ "drives" })
+end
+
+--[[
+    @method-name: flush
+    @method-desc: Write what has been collected to the storage now (in the background).
+--]]
+M.flush = function()
+    return run_json({ "flush-bg" })
+end
+
+--[[
+    @method-name: test_network
+    @method-desc: Mount the network folder with the saved settings and write a test file.
+--]]
+M.test_network = function()
+    return run_json({ "test-network" }, 60)
+end
+
+--[[
+    @method-name: install_support
+    @method-desc: Install the packages a network folder needs, in the background.
+    @in string type  smb or nfs.
+--]]
+M.install_support = function(params)
+    local t = type(params) == "table" and params.type
+    if t ~= "smb" and t ~= "nfs" then
+        return { err_code = -1, err_msg = "invalid value", field = "type" }
     end
-    return run_json(args, 60)
-end
-
---[[
-    @method-name: check
-    @method-desc: Take a reading now and return the new status.
---]]
-M.check = function()
-    run({ "check" }, 90)
-    return run_json({ "status" })
-end
-
---[[
-    @method-name: clear
-    @method-desc: Delete the stored history.
---]]
-M.clear = function()
-    return run_json({ "clear" }, 60)
+    return run_json({ "install-support", t })
 end
 
 -- ------------------------------------------------------------- settings --
@@ -113,28 +147,74 @@ local function range(lo, hi)
     end
 end
 
-local function text(max)
-    return function(v) return #v <= max and not v:find("[%z\1-\31\127]") end
+local function oneof(list)
+    local set = {}
+    for _, v in ipairs(list) do set[v] = true end
+    return function(v) return set[v] == true end
 end
 
+local function flag(v) return v == "0" or v == "1" end
+
+-- The same rules as the backend's safe_host, safe_path, safe_share, safe_rel.
 local function host(v)
-    return v:match("^[%w%.:_%-]+$") ~= nil and v:sub(1, 1) ~= "-" and #v <= 253
+    return v:match("^[%w%.:%-]+$") ~= nil and v:sub(1, 1) ~= "-" and #v <= 253
 end
+local function abs_path(v)
+    return v:match("^/[%w%._/%-]*$") ~= nil and not v:find("..", 1, true)
+end
+local function share(v)
+    return v:match("^[%w%._/%$ %-]+$") ~= nil and v:sub(1, 1) ~= "-" and not v:find("..", 1, true) and #v <= 200
+end
+local function folder(v)
+    return v:match("^[%w%._/ %-]+$") ~= nil and v:sub(1, 1) ~= "/" and not v:find("..", 1, true) and #v <= 200
+end
+local function user(v)
+    return v:match("^[%w%._@%-]+$") ~= nil and v:sub(1, 1) ~= "-" and #v <= 64
+end
+
+-- Settings with a fixed set of values. Keep in step with the options in
+-- common.js (tests/settings.test.js checks).
+local CHOICES = {
+    storage = { "usb", "network" },
+    compress = { "gzip", "xz", "none" },
+    flush_minutes = { "1", "5", "15" },
+    net_type = { "smb", "nfs" },
+    net_smbver = { "3.1.1", "3.0", "2.1", "2.0", "1.0" },
+    syslog_proto = { "udp", "tcp" },
+}
+local LEVELS = { "emerg", "alert", "crit", "err", "warn", "notice", "info", "debug" }
 
 -- Every setting the panel may change, with the check its value must pass.
--- Keep in step with LuCI's settings.js and the form in gl.js
--- (tests/settings.test.js checks).
+-- Keep in step with the schema in common.js, which both settings pages are
+-- drawn from (tests/settings.test.js checks).
 local FIELDS = {
-    enabled = { check = function(v) return v == "0" or v == "1" end },
-    interval = { check = range(1, 60) },
-    target = { check = host },
-    history_days = { optional = true, check = range(1, 730) },
+    enabled = { check = flag },
+    storage = { check = oneof(CHOICES.storage) },
+    usb_path = { optional = true, check = abs_path },
+    backup = { check = flag },
+    compress = { check = oneof(CHOICES.compress) },
+    flush_minutes = { check = oneof(CHOICES.flush_minutes) },
+    net_type = { check = oneof(CHOICES.net_type) },
+    net_server = { optional = true, check = host },
+    net_share = { optional = true, check = share },
+    net_folder = { optional = true, check = folder },
+    net_user = { optional = true, check = user },
+    net_smbver = { optional = true, check = oneof(CHOICES.net_smbver) },
+    syslog_send = { check = flag },
+    syslog_server = { optional = true, check = host },
+    syslog_port = { check = range(1, 65535) },
+    syslog_proto = { check = oneof(CHOICES.syslog_proto) },
 }
+for _, s in ipairs(SOURCES) do
+    FIELDS["src_" .. s] = { check = flag }
+    FIELDS[s .. "_days"] = { check = range(1, 3650) }
+    if LEVELED[s] then FIELDS[s .. "_level"] = { check = oneof(LEVELS) } end
+end
 M.FIELDS = FIELDS
 
 --[[
     @method-name: get_config
-    @method-desc: Current settings. The secret is not among them.
+    @method-desc: Current settings. The password is not among them.
 --]]
 M.get_config = function()
     local c = uci.cursor()
@@ -188,31 +268,31 @@ M.set_config = function(params)
         if ch[2] == false then c:delete("redbook", "main", ch[1]) else c:set("redbook", "main", ch[1], ch[2]) end
     end
     c:commit("redbook")
-    -- The scheduler re-reads its settings at least once a minute.
+    -- The daemon notices the change within half a minute and starts again.
     return { saved = true }
 end
 
 --[[
     @method-name: set_secret
-    @method-desc: Store the secret (root-only file). It cannot be read back.
+    @method-desc: Store the network folder's password (root-only file). It cannot be read back.
     @in string secret
 --]]
 M.set_secret = function(params)
     local s = type(params) == "table" and params.secret
     if type(s) ~= "string" or s == "" then
-        return { err_code = -1, err_msg = "no secret was sent", field = "secret" }
+        return { err_code = -1, err_msg = "no password was sent", field = "secret" }
     end
     if not text(128)(s) then
         return { err_code = -1, err_msg = "invalid value", field = "secret" }
     end
-    -- The file must exist and be root only before the secret goes in
+    -- The file must exist and be root only before the password goes in
     -- (UCI keeps a file's mode when it rewrites it).
     local f = io.open(AUTH, "a")
     if f then f:close() end
     spawn({ "/bin/chmod", "600", AUTH }, 10)
     local c = uci.cursor()
     if not c:get("redbook_auth", "main") then c:set("redbook_auth", "main", "auth") end
-    c:set("redbook_auth", "main", "secret", s)
+    c:set("redbook_auth", "main", "net_password", s)
     c:commit("redbook_auth")
     return { ok = true }
 end
