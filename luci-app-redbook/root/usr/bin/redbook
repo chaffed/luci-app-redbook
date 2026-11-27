@@ -45,8 +45,11 @@
 # reaches mount.cifs in a credentials file in RAM that is deleted at once.
 #
 # SPDX-License-Identifier: MIT
-# shellcheck shell=dash disable=SC2034,SC2154
-# (SC2154: ON_*, DAYS_* and LEVEL_* are set through eval in load_config.)
+# shellcheck shell=dash disable=SC2034,SC2154,SC2016,SC2012,SC2013,SC2015
+# SC2154: ON_*, DAYS_* and LEVEL_* are set through eval in load_config.
+# SC2016: awk programs and `sh -c` scripts are single-quoted on purpose.
+# SC2012/SC2013: ls and word lists only ever see file names Red Book made
+# (dates, source ids), which have no spaces.
 
 CONFIG=redbook
 VERSION=0.1.0   # the package's PKG_VERSION
@@ -214,7 +217,13 @@ space_kb() { df -kP "$1" 2>/dev/null | awk 'NR == 2 { print $2, $4 }'; }
 
 # -------------------------------------------------------- network folder
 
-net_mounted() { awk -v m="$MNT" '$2 == m { print $3; f = 1 } END { exit !f }' /proc/mounts 2>/dev/null; }
+# /proc/mounts shows the real path: on OpenWrt /var is a link to /tmp, so
+# /var/run/redbook/net is listed as /tmp/run/redbook/net.
+net_mounted() {
+	local m
+	m=$(cd "$MNT" 2>/dev/null && pwd -P) || return 1
+	awk -v m="$m" '$2 == m { print $3; f = 1 } END { exit !f }' /proc/mounts 2>/dev/null
+}
 net_label() {
 	if [ "$NET_TYPE" = nfs ]; then printf '%s:%s' "$NET_SERVER" "$NET_SHARE"; else printf '//%s/%s' "$NET_SERVER" "$NET_SHARE"; fi
 	[ -n "$NET_FOLDER" ] && printf '/%s' "$NET_FOLDER"
@@ -248,7 +257,7 @@ mount_reason() { # $1=exit code $2=output
 		*"error(2)"*|*"No such file"*|*"No such device"*) echo share_not_found ;;
 		*"error(111)"*|*"onnection refused"*) echo refused ;;
 		*"error(95)"*|*"not supported"*|*"error(22)"*) echo version_mismatch ;;
-		*"error(112)"*|*"error(113)"*|*"error(115)"*|*"error(110)"*|*"Host is down"*|*"No route"*|*"timed out"*) echo unreachable ;;
+		*"error(101)"*|*"error(112)"*|*"error(113)"*|*"error(115)"*|*"error(110)"*|*"Host is down"*|*"No route"*|*"timed out"*) echo unreachable ;;
 		*"resolve"*|*"find suitable address"*|*"bad address"*|*"Name or service"*) echo unreachable ;;
 		*) echo mount_failed ;;
 	esac
@@ -259,7 +268,7 @@ mount_net() {
 	case $NET_TYPE in
 		smb)
 			pass=$(net_password)
-			opts="uid=0,gid=0,file_mode=0600,dir_mode=0700,soft,noserverino,iocharset=utf8"
+			opts="uid=0,gid=0,file_mode=0600,dir_mode=0700,soft,noserverino"
 			[ -n "$NET_SMBVER" ] && opts="$opts,vers=$NET_SMBVER"
 			if [ -z "$NET_USER" ] && [ -z "$pass" ]; then
 				opts="guest,$opts"
@@ -821,6 +830,10 @@ applied_del() {
 	[ -f "$f" ] || return 0
 	grep -v "^$1=" "$f" > "$f.new"; mv "$f.new" "$f"
 }
+# Reload another service without waiting for it: a stuck init script (one
+# was seen in a container) must not stop the logs being kept.
+reload_bg() { ( "/etc/init.d/$1" reload </dev/null >/dev/null 2>&1 & ) ; }
+
 uci_restore() { # $1=config.section.option $2=saved value ("-" = was not set)
 	if [ "$2" = - ]; then uci -q delete "$1"; else uci set "$1=$2"; fi
 }
@@ -838,11 +851,11 @@ do_apply() { # $1=revert: undo everything
 	if [ $want = 1 ] && [ -z "$(applied_get dns)" ]; then
 		applied_set dns_prev "$(uci -q get dhcp.@dnsmasq[0].logqueries || echo -)"
 		applied_set dns 1
-		uci set dhcp.@dnsmasq[0].logqueries=1 && uci commit dhcp && /etc/init.d/dnsmasq reload >/dev/null 2>&1
+		uci set dhcp.@dnsmasq[0].logqueries=1 && uci commit dhcp && reload_bg dnsmasq
 		log "turned on DNS query logging in dnsmasq"
 	elif [ $want = 0 ] && [ -n "$(applied_get dns)" ]; then
 		uci_restore dhcp.@dnsmasq[0].logqueries "$(applied_get dns_prev)"
-		uci commit dhcp && /etc/init.d/dnsmasq reload >/dev/null 2>&1
+		uci commit dhcp && reload_bg dnsmasq
 		applied_del dns; applied_del dns_prev
 		log "put DNS query logging in dnsmasq back as it was"
 	fi
@@ -864,7 +877,7 @@ do_apply() { # $1=revert: undo everything
 		done
 	fi
 	if [ $changed = 1 ]; then
-		uci commit firewall && /etc/init.d/firewall reload >/dev/null 2>&1
+		uci commit firewall && reload_bg firewall
 		if [ $want = 1 ]; then log "turned on logging of blocked packets in the firewall"; else log "put firewall logging back as it was"; fi
 	fi
 
@@ -880,13 +893,13 @@ do_apply() { # $1=revert: undo everything
 		uci set system.@system[0].log_ip="$SYSLOG_SERVER"
 		uci set system.@system[0].log_port="$SYSLOG_PORT"
 		uci set system.@system[0].log_proto="$SYSLOG_PROTO"
-		uci commit system && /etc/init.d/log reload >/dev/null 2>&1
+		uci commit system && reload_bg log
 		log "sending the system log to $SYSLOG_SERVER port $SYSLOG_PORT ($SYSLOG_PROTO)"
 	elif [ $want = 0 ] && [ -n "$(applied_get syslog)" ]; then
 		uci_restore system.@system[0].log_ip "$(applied_get syslog_ip)"
 		uci_restore system.@system[0].log_port "$(applied_get syslog_port)"
 		uci_restore system.@system[0].log_proto "$(applied_get syslog_proto)"
-		uci commit system && /etc/init.d/log reload >/dev/null 2>&1
+		uci commit system && reload_bg log
 		applied_del syslog; applied_del syslog_ip; applied_del syslog_port; applied_del syslog_proto
 		log "put the syslog server setting back as it was"
 	fi
@@ -920,7 +933,8 @@ stop_collector() { # $1=name
 	for p in $(cat "$RUN_DIR/$1.pids"); do
 		[ -r "/proc/$p/cmdline" ] || continue
 		cmd=$(tr '\000' ' ' < "/proc/$p/cmdline")
-		case "$cmd" in *app=redbook*|"logread -f -t -l "*|"conntrack -E "*) kill "$p" 2>/dev/null ;; esac
+		# The shell starts them as /sbin/logread, /usr/sbin/conntrack.
+		case "$cmd" in *app=redbook*|*"logread -f -t -l "*|*"conntrack -E -e NEW"*) kill "$p" 2>/dev/null ;; esac
 	done
 	rm -f "$RUN_DIR/$1.pids" "$RUN_DIR/$1.fifo"
 }

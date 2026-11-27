@@ -172,6 +172,7 @@ redbook flush >/dev/null 2>&1
 check "[ \$(grep -c rbtest-notice-1 $H/system/$TODAY.log) = 1 ] && [ \$(grep -c rbtest-notice-2 $H/system/$TODAY.log) = 1 ]" "after restarts every line is there once"
 check "read -r id at < $H/.state/stopped && [ \"\$id\" = \"\$(cat /proc/sys/kernel/random/boot_id)\" ]" "a stop is recorded as clean"
 check "[ \"\$(redbook status | jsonfilter -e @.collectors.logread)\" = true ]" "the collector runs again after a restart"
+check "[ \$(ps w | grep -c '[l]ogread -f -t -l') = 1 ]" "after settings changes and restarts, exactly one collector runs (no orphans)"
 
 # ----------------------------------------------------------- router settings
 uci -q delete dhcp.@dnsmasq[0].logqueries

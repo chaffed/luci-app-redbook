@@ -41,10 +41,24 @@ jobs:
       - name: Every setting in LuCI, the GL panel form and its module
         run: node tests/settings.test.js
 
+      - name: The backend on OpenWrt 23.05 (filing, writing, an unplugged drive, router settings)
+        run: sh tests/backend.test.sh
+
+      - name: The network folder against a Samba server
+        run: |
+          sudo modprobe cifs
+          sh tests/network.test.sh
+
       - name: The pages in a browser (LuCI and GL panel stand-in, OpenWrt 23.05 container)
         run: |
           npm install --no-save playwright-core
           node tests/web.test.js
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots
+          path: .test-out/web/*.png
 
       - name: Build ipk
         run: scripts/build-ipk.sh dist
