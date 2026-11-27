@@ -49,14 +49,14 @@ T=/tmp/t; rm -rf $T; mkdir -p $T
 	load_config
 	SPOOL=$T/spool; spool_dirs
 	cat > $T/in <<'LINES'
-Fri Nov 27 08:04:37 2026 [1795795477.166] authpriv.info dropbear[4295]: Child connection from 192.168.8.140:53440
+Fri Nov 27 08:04:37 2026 [1795795477.166] authpriv.info dropbear[4295]: Child connection from 192.168.8.50:53440
 Fri Nov 27 08:04:38 2026 [1795795478.000] daemon.debug foo: debug noise
 Fri Nov 27 08:04:39 2026 [1795795479.000] kern.warn kernel: [597120.1] DROP(src wan)IN=eth0 OUT= MAC=aa SRC=203.0.113.4 DST=198.51.100.7
 Fri Nov 27 08:04:40 2026 [1795795480.000] kern.err kernel: [597121.1] usb 1-1: device descriptor read error
-Fri Nov 27 08:04:41 2026 [1795795481.000] daemon.info dnsmasq[28302]: query[A] example.com from 192.168.8.140
+Fri Nov 27 08:04:41 2026 [1795795481.000] daemon.info dnsmasq[28302]: query[A] example.com from 192.168.8.50
 Fri Nov 27 08:04:41 2026 [1795795481.100] daemon.info dnsmasq[28302]: forwarded example.com to 127.0.0.1#3053
 Fri Nov 27 08:04:41 2026 [1795795481.200] daemon.info dnsmasq[28302]: reply example.com is 93.184.216.34
-Fri Nov 27 08:04:42 2026 [1795795482.000] daemon.info dnsmasq-dhcp[28302]: DHCPACK(br-lan) 192.168.8.140 aa:bb:cc:dd:ee:ff
+Fri Nov 27 08:04:42 2026 [1795795482.000] daemon.info dnsmasq-dhcp[28302]: DHCPACK(br-lan) 192.168.8.50 aa:bb:cc:dd:ee:ff
 Sun Nov  1 01:00:00 2026 [1795795483.000] user.notice x: a single-digit day
 Wed Oct 21 01:00:00 2026 [1795795484.000] user.notice x: dated before the router started
 LINES
