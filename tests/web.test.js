@@ -80,6 +80,14 @@ async function waitFor(fn, ms) {
 			'/usr/bin/redbook flush >/dev/null 2>&1 || true'
 		].join('\n'));
 
+		/* The collector reads logd on its own time: wait until both test lines
+		   are kept, or the viewer checks below can pass (or fail) on a page
+		   that does not hold the hostile line yet. */
+		ok(await waitFor(function() {
+			var s = router('/usr/bin/redbook lines system 50 rbweb');
+			return s.indexOf('rbweb-line-1') >= 0 && s.indexOf('rbweb-hostile') >= 0;
+		}, 30000), 'both test lines are collected');
+
 		browser = await playwright.chromium.launch(process.env.APP_CHROME ? { executablePath: process.env.APP_CHROME } : { channel: 'chrome' });
 		var page = await (await browser.newContext({ viewport: { width: 1280, height: 900 } })).newPage();
 		page.on('response', function(res) {
@@ -160,7 +168,7 @@ async function waitFor(fn, ms) {
 		await frame.selectOption('#redbook-source', 'system');
 		await frame.click('text=Show');
 		await frame.waitForSelector('#redbook-lines >> text=rbweb-line-1', { timeout: 15000 });
-		ok((await frame.$$('#redbook-lines img')).length === 0, 'GL panel: the log viewer shows lines as text');
+		ok((await frame.textContent('#redbook-lines')).indexOf(HOSTILE) >= 0 && (await frame.$$('#redbook-lines img')).length === 0, 'GL panel: the log viewer shows lines as text');
 		await page.screenshot({ path: path.join(SHOTS, 'gl-overview.png'), fullPage: true });
 
 		await frame.click('button[data-page=settings]');
