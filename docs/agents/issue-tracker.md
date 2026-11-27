@@ -14,7 +14,6 @@ Issues and specs for this repo live as GitHub issues. Use the `gh` CLI for all o
 
 The repository is **chaffed/luci-app-redbook**. Infer it from `git remote -v`; `gh` does this automatically when run inside a clone.
 
-> **Not created yet.** Until the repository exists on GitHub and is this clone's `origin`, `gh issue` commands here will fail. When it is created, also create the triage labels in `triage-labels.md` (`gh label create <name>` for each).
 
 ## Pull requests as a triage surface
 

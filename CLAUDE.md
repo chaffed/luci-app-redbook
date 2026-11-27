@@ -33,7 +33,7 @@ Red Book: keeps the router's logs on a USB drive or a network folder (SMB, NFS),
 
 ### Issue tracker
 
-GitHub Issues on chaffed/luci-app-redbook, through `gh` (the repository is not created yet). See `docs/agents/issue-tracker.md`.
+GitHub Issues on chaffed/luci-app-redbook, through `gh`. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
