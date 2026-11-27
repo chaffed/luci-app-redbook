@@ -78,8 +78,27 @@ LINES
 	rm -rf $SPOOL $T/last; spool_dirs
 	run 6 0 0
 	cat $SPOOL/kernel/*.cur > $T/kernel_nofw 2>/dev/null
+	# Lines that share a millisecond (a quarter of them on a GL-BE9300), two
+	# of them identical; then a restart whose backlog repeats them, with one
+	# more line in the same millisecond and one after.
+	rm -rf $SPOOL $T/last; spool_dirs
+	cat > $T/in <<'LINES'
+Fri Nov 27 08:05:00 2026 [1795795500.001] user.notice x: same-ms a
+Fri Nov 27 08:05:00 2026 [1795795500.001] user.notice x: same-ms b
+Fri Nov 27 08:05:00 2026 [1795795500.001] user.notice x: same-ms b
+LINES
+	run 6 0
+	cat $SPOOL/system/*.cur > $T/samems1
+	cat >> $T/in <<'LINES'
+Fri Nov 27 08:05:00 2026 [1795795500.001] user.notice x: same-ms c
+Fri Nov 27 08:05:00 2026 [1795795500.002] user.notice x: same-ms d
+LINES
+	run 6 0
+	cat $SPOOL/system/*.cur > $T/samems2
 	true
 )
+check "[ \$(grep -c 'same-ms a' $T/samems1) = 1 ] && [ \$(grep -c 'same-ms b' $T/samems1) = 2 ]" "lines in the same millisecond are all kept, identical ones too"
+check "[ \$(wc -l < $T/samems2) = 5 ] && [ \$(grep -c 'same-ms b' $T/samems2) = 2 ] && grep -q 'same-ms c' $T/samems2 && grep -q 'same-ms d' $T/samems2" "after a restart: lines of that millisecond not yet kept are added, nothing twice"
 check "grep -q 'dropbear\[4295\]: Child connection' $T/system && ! grep -q 'debug noise' $T/system" "system log: info kept, debug left out at level info"
 check "! grep -q '\[1795795477.166\]' $T/system && grep -q '^Fri Nov 27 08:04:37 2026 authpriv.info dropbear' $T/system" "system log: stored as logread shows it, without the extra time stamp"
 check "grep -q 'DROP(src wan)' $T/firewall && ! grep -q DROP $T/kernel && ! grep -q DROP $T/system" "firewall blocks go to their own log, not the kernel log"
