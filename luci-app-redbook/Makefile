@@ -1,4 +1,4 @@
-# Red Book - Keeps the router's logs on a USB drive or network folder for troubleshooting and security analysis.
+# Red Book - keeps the router's logs on a USB drive or a network folder, for troubleshooting and security analysis.
 # Drop this directory into an OpenWrt/LuCI feed (feeds/luci/applications/)
 # or build a standalone .ipk with scripts/build-ipk.sh.
 #
@@ -11,7 +11,7 @@ PKG_VERSION:=0.1.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 
-LUCI_TITLE:=Red Book - Keeps the router's logs on a USB drive or network folder for troubleshooting and security analysis.
+LUCI_TITLE:=Red Book - keeps the router's logs on a USB drive or a network folder
 LUCI_DEPENDS:=+luci-base
 LUCI_PKGARCH:=all
 

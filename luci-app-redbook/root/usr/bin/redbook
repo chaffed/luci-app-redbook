@@ -1,203 +1,1072 @@
 #!/bin/sh
-# Red Book: Keeps the router's logs on a USB drive or network folder for troubleshooting and security analysis.
+# Red Book: keeps the router's logs on a USB drive or a network folder, for
+# troubleshooting and security analysis.
 #
-#   redbook check            take one reading and store it
-#   redbook daemon           check on schedule (started by /etc/init.d/redbook)
-#   redbook status           state and the latest reading, as JSON
-#   redbook data SINCE [UNTIL]
-#                            stored readings between two times (epoch
-#                            seconds), as JSON with the CSV text inside
-#   redbook set-secret       read a new secret from stdin and save it
-#   redbook clear            delete the stored history
+#   redbook daemon           collect and write on schedule (started by /etc/init.d/redbook)
+#   redbook flush            write what has been collected, now
+#   redbook flush-bg         the same, in the background (for the web pages)
+#   redbook status           storage, backup, sources and router settings, as JSON
+#   redbook lines SRC [N] [TEXT]
+#                            the last N lines of a source's newest day (only
+#                            lines containing TEXT), as JSON with the text inside
+#   redbook drives           mounted USB drives, as JSON
+#   redbook set-secret       read the network folder's password from stdin and save it
+#   redbook test-network     mount the network folder with the saved settings and write a test file
+#   redbook install-support smb|nfs
+#                            install the packages a network folder needs (in the background)
+#   redbook apply            make the router's settings match Red Book's (DNS, firewall, syslog)
+#   redbook revert           undo every router setting Red Book changed (on removal)
 #
-# The secret lives in /etc/config/redbook_auth (root only), apart from the
-# other settings, because the web pages load the whole settings file. It
-# goes in (set-secret) and never comes out: status only says whether one is
-# set.
+# Where the logs go: <storage>/redbook/<hostname>/<source>/YYYY-MM-DD.log,
+# one file per source and day. <storage> is a USB drive or a network folder
+# (SMB or NFS), and the USB files can also be copied to a network folder.
+# Finished days are compressed (gzip or xz) and their SHA-256 is added to
+# <source>/SHA256SUMS; if late lines are added to a finished day, a new line
+# is added for it there (the last line for a file is the one that counts).
+# Days older than the source's limit are deleted.
 #
-# Storage: one CSV file per day in DATA_DIR/readings/ (days before today
-# gzipped, days past history_days removed). A reading that could not be
-# taken is stored as "failed" with its reason, never as an empty or good
-# reading.
+# Collected lines wait in a buffer in RAM (/var/run/redbook/spool) and are
+# written every 1, 5 or 15 minutes, only after checking that the storage is
+# really there: an unplugged drive's mount point is a folder in RAM. If the
+# storage stays away and the buffer fills, the oldest lines are dropped and
+# a line saying how many were lost, and when, is written into the log: a
+# gap is never silent.
 #
-# This file was generated from the openwrt-router-app skill's template; the
-# check itself (do_measure) is the part to replace.
+# Router settings Red Book changes, only while the matching option is on,
+# and puts back when it is turned off or the package is removed (the
+# original values are kept in /etc/redbook/applied):
+#   DNS queries      dhcp.@dnsmasq[0].logqueries=1
+#   Firewall blocks  firewall zone option log=1, every zone but lan
+#   Syslog server    system.@system[0].log_ip / log_port / log_proto
+#
+# The network folder's password lives in /etc/config/redbook_auth (root
+# only), apart from the other settings, because the web pages load the
+# whole settings file. It goes in (set-secret) and never comes out; it
+# reaches mount.cifs in a credentials file in RAM that is deleted at once.
 #
 # SPDX-License-Identifier: MIT
-# shellcheck shell=dash
+# shellcheck shell=dash disable=SC2034,SC2154
+# (SC2154: ON_*, DAYS_* and LEVEL_* are set through eval in load_config.)
 
 CONFIG=redbook
 VERSION=0.1.0   # the package's PKG_VERSION
-READINGS_HEADER='ts,result,reason,loss_pct,avg_ms'
+SOURCES='system kernel crash boots health web mesh dns firewall conn'
 
 log() { logger -t redbook "$*" 2>/dev/null; [ -t 2 ] && echo "redbook: $*" >&2; return 0; }
 
-# Text from outside goes into CSV files and, later, web pages: keep it to
-# printable characters without the CSV and HTML specials.
+# Text from outside that goes into JSON for the web pages.
 clean() { printf '%s' "$*" | tr -d '\000-\037",\\<>' | cut -c1-120; }
 int_or() { case "$1" in ''|*[!0-9]*) echo "$2" ;; *) echo "$1" ;; esac; }
 json_str() { printf '"%s"' "$(printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
 json_num() { case "$1" in ''|*[!0-9.-]*) printf null ;; *) printf '%s' "$1" ;; esac; }
+json_bool() { [ "$1" = 1 ] && printf true || printf false; }
+stamp() { date '+%Y-%m-%d %H:%M:%S'; }
+# A time limit where busybox has `timeout` (GL firmware does; plain
+# OpenWrt 23.05 images may not), none otherwise.
+tmo() { local s=$1; shift; if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; else "$@"; fi; }
+when() { date -d "@$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null; }
+
+# ---------------------------------------------------------------- settings
+
+# Every value is treated as hostile (this runs as root); the GL panel module
+# applies the same rules (FIELDS in /usr/lib/oui-httpd/rpc/redbook).
+safe_path() { # absolute, plain characters, no ".."
+	case "$1" in /*) ;; *) return 1 ;; esac
+	case "$1" in *[!A-Za-z0-9._/-]*|*..*) return 1 ;; esac
+}
+safe_host() {
+	[ -n "$1" ] && [ ${#1} -le 253 ] || return 1
+	case "$1" in -*|*[!A-Za-z0-9.:-]*) return 1 ;; esac
+}
+safe_share() { # an SMB share name or an NFS export path
+	[ -n "$1" ] && [ ${#1} -le 200 ] || return 1
+	case "$1" in -*|*[!A-Za-z0-9._/\$\ -]*|*..*) return 1 ;; esac
+}
+safe_rel() { # a folder inside the share; empty is fine
+	[ ${#1} -le 200 ] || return 1
+	case "$1" in /*|*[!A-Za-z0-9._/\ -]*|*..*) return 1 ;; esac
+}
+
+level_num() {
+	case "$1" in
+		emerg) echo 0 ;; alert) echo 1 ;; crit) echo 2 ;; err) echo 3 ;;
+		warn) echo 4 ;; notice) echo 5 ;; info) echo 6 ;; debug) echo 7 ;;
+		*) echo 6 ;;
+	esac
+}
+# Defaults; /etc/config/redbook and the pages' schema (common.js) hold the
+# same ones (tests/settings.test.js checks).
+default_on() { case $1 in system|kernel|crash|boots|health|web) echo 1 ;; *) echo 0 ;; esac; }
+default_days() { case $1 in crash|boots) echo 365 ;; mesh|dns|firewall|conn) echo 30 ;; *) echo 90 ;; esac; }
+default_level() { case $1 in web|mesh) echo warn ;; *) echo info ;; esac; }
+has_level() { case $1 in system|kernel|web|mesh) return 0 ;; esac; return 1; }
+src_on() { eval "[ \"\$ON_$1\" = 1 ]"; }
+src_days() { eval "echo \"\$DAYS_$1\""; }
+src_level() { eval "echo \"\$LEVEL_$1\""; }
+
+opt() { uci -q get "$CONFIG.main.$1"; }
 
 load_config() {
-	ENABLED=$(uci -q get "$CONFIG.main.enabled"); ENABLED=${ENABLED:-1}
-	INTERVAL=$(int_or "$(uci -q get "$CONFIG.main.interval")" 5)
-	[ "$INTERVAL" -ge 1 ] || INTERVAL=1
-	TARGET=$(uci -q get "$CONFIG.main.target"); TARGET=${TARGET:-1.1.1.1}
-	HISTORY_DAYS=$(int_or "$(uci -q get "$CONFIG.main.history_days")" 90)
-	[ "$HISTORY_DAYS" -ge 1 ] || HISTORY_DAYS=1
-	DATA_DIR=$(uci -q get "$CONFIG.main.data_dir"); DATA_DIR=${DATA_DIR:-/etc/redbook}
-	SECRET=$(uci -q get "${CONFIG}_auth.main.secret")
-	RUN_DIR=${REDBOOK_RUN_DIR:-/var/run/redbook}
-}
-
-# ------------------------------------------------------------------- storage
-
-today() { date +%Y-%m-%d; }
-
-ensure_store() {
-	mkdir -p "$DATA_DIR/readings" || return 1
-	DAY=$(today)
-	READINGS="$DATA_DIR/readings/$DAY.csv"
-	[ -s "$READINGS" ] || echo "$READINGS_HEADER" > "$READINGS"
-}
-
-# Gzip finished days, remove days past the history that is kept. Dates are
-# compared as YYYYMMDD numbers: busybox `test` has no reliable string "<".
-tidy_store() {
-	local cutoff f name
-	cutoff=$(date -d "@$(( $(date +%s) - HISTORY_DAYS * 86400 ))" +%Y%m%d 2>/dev/null) || return 0
-	for f in "$DATA_DIR"/readings/*.csv*; do
-		[ -e "$f" ] || continue
-		name=${f##*/}; name=${name%%.*}
-		case $name in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) continue ;; esac
-		if [ "$(echo "$name" | tr -d -)" -lt "$cutoff" ]; then
-			rm -f "$f"
-		elif [ "$name" != "$DAY" ] && [ "${f%.gz}" = "$f" ]; then
-			gzip -f "$f"
-		fi
+	local s v
+	ENABLED=$(opt enabled); [ "$ENABLED" = 0 ] || ENABLED=1
+	STORAGE=$(opt storage); [ "$STORAGE" = network ] || STORAGE=usb
+	# A drive folder that fails the check is an error, not "the first drive":
+	# the logs must never end up somewhere nobody chose.
+	USB_PATH=$(opt usb_path); USB_BAD=0
+	[ -z "$USB_PATH" ] || safe_path "$USB_PATH" || { USB_PATH=''; USB_BAD=1; }
+	BACKUP=$(opt backup); [ "$BACKUP" = 1 ] || BACKUP=0
+	COMPRESS=$(opt compress); case $COMPRESS in gzip|xz|none) ;; *) COMPRESS=gzip ;; esac
+	[ "$COMPRESS" = xz ] && ! command -v xz >/dev/null 2>&1 && COMPRESS=gzip
+	FLUSH_MIN=$(opt flush_minutes); case $FLUSH_MIN in 1|5|15) ;; *) FLUSH_MIN=1 ;; esac
+	NET_TYPE=$(opt net_type); [ "$NET_TYPE" = nfs ] || NET_TYPE=smb
+	NET_SERVER=$(opt net_server); safe_host "$NET_SERVER" || NET_SERVER=''
+	NET_SHARE=$(opt net_share); safe_share "$NET_SHARE" || NET_SHARE=''
+	NET_FOLDER=$(opt net_folder); NET_FOLDER=${NET_FOLDER%/}; safe_rel "$NET_FOLDER" || NET_FOLDER=''
+	NET_USER=$(opt net_user); case $NET_USER in -*|*[!A-Za-z0-9._@-]*) NET_USER='' ;; esac
+	NET_SMBVER=$(opt net_smbver); case $NET_SMBVER in 1.0|2.0|2.1|3.0|3.1.1) ;; *) NET_SMBVER='' ;; esac
+	SYSLOG_SEND=$(opt syslog_send); [ "$SYSLOG_SEND" = 1 ] || SYSLOG_SEND=0
+	SYSLOG_SERVER=$(opt syslog_server); safe_host "$SYSLOG_SERVER" || SYSLOG_SERVER=''
+	SYSLOG_PORT=$(int_or "$(opt syslog_port)" 514); [ "$SYSLOG_PORT" -ge 1 ] && [ "$SYSLOG_PORT" -le 65535 ] || SYSLOG_PORT=514
+	SYSLOG_PROTO=$(opt syslog_proto); [ "$SYSLOG_PROTO" = tcp ] || SYSLOG_PROTO=udp
+	for s in $SOURCES; do
+		v=$(opt "src_$s"); case $v in 0|1) ;; *) v=$(default_on "$s") ;; esac
+		eval "ON_$s=$v"
+		v=$(int_or "$(opt "${s}_days")" "$(default_days "$s")")
+		{ [ "$v" -ge 1 ] && [ "$v" -le 3650 ]; } || v=$(default_days "$s")
+		eval "DAYS_$s=$v"
+		v=$(opt "${s}_level")
+		case $v in emerg|alert|crit|err|warn|notice|info|debug) ;; *) v=$(default_level "$s") ;; esac
+		eval "LEVEL_$s=$v"
 	done
+	RUN_DIR=${REDBOOK_RUN_DIR:-/var/run/redbook}
+	STATE_DIR=${REDBOOK_STATE_DIR:-/etc/redbook}
+	SPOOL=$RUN_DIR/spool
+	MNT=$RUN_DIR/net
+	SPOOL_MAX_KB=$(int_or "${REDBOOK_SPOOL_MAX_KB:-}" 16384)
+	MIN_FREE_KB=$(int_or "${REDBOOK_MIN_FREE_KB:-}" 51200)
+	MESH_DIR=${REDBOOK_MESH_DIR:-/tmp/beerocks/logs}
+	WEB_LOG=${REDBOOK_WEB_LOG:-/tmp/log/nginx/error.log}
+	HOST=$(tr -cd 'A-Za-z0-9._-' < /proc/sys/kernel/hostname 2>/dev/null); HOST=${HOST:-router}
+	read -r BOOT_ID < /proc/sys/kernel/random/boot_id 2>/dev/null; BOOT_ID=${BOOT_ID:-unknown}
 }
 
-# ------------------------------------------------------------------- the check
-
-# do_measure -> sets RESULT to "loss_pct,avg_ms" and returns 0, or sets
-# FAIL_REASON and returns 1. Replace this with what your app measures.
-# Call it directly, not as $(do_measure): variables set in a command
-# substitution's subshell are lost.
-do_measure() {
-	local out
-	out=$(ping -c 3 -W 2 -q "$TARGET" 2>/dev/null | awk '
-		/packet loss/ { for (i = 1; i <= NF; i++) if ($i ~ /%$/) { sub(/%/, "", $i); loss = $i } }
-		/min\/avg\/max/ { split($0, a, "="); split(a[2], b, "/"); avg = b[2] + 0 }
-		END { if (loss != "") print loss "," avg }')
-	if [ -z "$out" ]; then
-		FAIL_REASON=no_answer
-		return 1
-	fi
-	RESULT=$out
-}
-
-do_check() {
-	local ts
-	load_config
-	mkdir -p "$RUN_DIR" && chmod 700 "$RUN_DIR"
-	ensure_store || { log "cannot write to $DATA_DIR"; return 1; }
-	# One check at a time (the daemon and a click on "Check now"). Busybox
-	# flock has no -w (timeout): only -s -x -u -n.
-	exec 9> "$RUN_DIR/lock"
-	flock -x 9 || { log "could not lock $RUN_DIR/lock"; return 1; }
-	ts=$(date +%s)
-	FAIL_REASON=''; RESULT=''
-	if do_measure; then
-		echo "$ts,ok,,$RESULT" >> "$READINGS"
-	else
-		echo "$ts,failed,$(clean "${FAIL_REASON:-unknown}"),," >> "$READINGS"
-		log "check failed: $FAIL_REASON"
-	fi
-	tidy_store
-}
-
-# ------------------------------------------------------------------- daemon
+# ------------------------------------------------------------------- clock
 
 uptime_s() { local u; read -r u _ < /proc/uptime; echo "${u%.*}"; }
 
-# Interruptible sleep (lets the TERM trap run straight away).
-nap() { sleep "$1" & SLEEP_PID=$!; wait "$SLEEP_PID"; }
-
-# The router has no battery-backed clock: until NTP has set the time a
-# reading would carry the wrong date. The ntp hotplug (shipped with
-# dnsmasq) leaves this flag once the time is valid; without it, give NTP
-# ten minutes.
+# The router has no battery-backed clock: until NTP has set the time a line
+# would be filed under the wrong day. The ntp hotplug (shipped with dnsmasq)
+# leaves this flag once the time is valid; without it, give NTP ten minutes.
 time_synced() {
 	[ -e /var/state/dnsmasqsec ] && return 0
 	[ "$(uptime_s)" -ge 600 ]
 }
 
-do_daemon() {
-	local base="" up due
-	SLEEP_PID=""; CHECK_PID=""
-	trap 'kill $SLEEP_PID $CHECK_PID 2>/dev/null; rm -f "$RUN_DIR/next"; exit 0' INT TERM
+boot_day() { date -d "@$(( $(date +%s) - $(uptime_s) ))" +%Y-%m-%d; }
+
+# ------------------------------------------------------------------ drives
+
+mount_of() { # $1=absolute path -> "mountpoint fstype"
+	awk -v p="$1" '
+		{
+			m = $2
+			if (m == "/" || p == m || index(p, m "/") == 1)
+				if (length(m) >= length(best)) { best = m; fs = $3 }
+		}
+		END { if (best != "") print best, fs }' /proc/mounts 2>/dev/null
+}
+internal_fs() {
+	case "$1" in
+		''|rootfs|overlay|squashfs|jffs2|ubifs|tmpfs|ramfs|devtmpfs|devpts|proc|sysfs) return 0 ;;
+		debugfs|tracefs|pstore|bpf|cgroup*|autofs|mqueue|securityfs|configfs|fusectl) return 0 ;;
+	esac
+	return 1
+}
+net_fs() { case "$1" in cifs|smb3|nfs|nfs4|fuse.sshfs) return 0 ;; esac; return 1; }
+existing_dir() { # $1=absolute path
+	local d="$1"
+	while [ -n "$d" ] && [ ! -d "$d" ]; do d=${d%/*}; done
+	( cd "${d:-/}" 2>/dev/null && pwd -P )
+}
+# A folder on a real local drive, not RAM or flash, and not a network mount.
+on_usb() {
+	# shellcheck disable=SC2046
+	set -- $(mount_of "$(existing_dir "$1")")
+	case "$1" in ''|/|/rom|/overlay) return 1 ;; esac
+	internal_fs "$2" && return 1
+	net_fs "$2" && return 1
+	return 0
+}
+list_drives() {
+	local mp fs opts
+	while read -r _ mp fs opts _; do
+		case "$opts" in ro|ro,*) continue ;; esac
+		case "$mp" in
+			/|/rom*|/overlay*|/boot*|/proc*|/sys*|/dev*|/etc*|/lib*|/usr*|/www*|/bin*|/sbin*|/var/run/*|/tmp/run/*) continue ;;
+			*[!A-Za-z0-9._/-]*) continue ;;
+		esac
+		internal_fs "$fs" && continue
+		net_fs "$fs" && continue
+		[ -d "$mp" ] && echo "$mp $fs"
+	done < /proc/mounts | sort -u
+}
+space_kb() { df -kP "$1" 2>/dev/null | awk 'NR == 2 { print $2, $4 }'; }
+
+# -------------------------------------------------------- network folder
+
+net_mounted() { awk -v m="$MNT" '$2 == m { print $3; f = 1 } END { exit !f }' /proc/mounts 2>/dev/null; }
+net_label() {
+	if [ "$NET_TYPE" = nfs ]; then printf '%s:%s' "$NET_SERVER" "$NET_SHARE"; else printf '//%s/%s' "$NET_SERVER" "$NET_SHARE"; fi
+	[ -n "$NET_FOLDER" ] && printf '/%s' "$NET_FOLDER"
+	return 0
+}
+net_password() { uci -q get "${CONFIG}_auth.main.net_password"; }
+# What the current mount was made from; a change means mount again. The
+# password is in it only as a checksum, in a root-only folder in RAM.
+net_signature() {
+	printf '%s|%s|%s|%s|%s|%s' "$NET_TYPE" "$NET_SERVER" "$NET_SHARE" "$NET_USER" "$NET_SMBVER" \
+		"$(net_password | md5sum | cut -c1-32)"
+}
+net_support() {
+	case "$1" in
+		smb) command -v mount.cifs >/dev/null 2>&1 || return 1
+			grep -qw cifs /proc/filesystems 2>/dev/null || modprobe cifs 2>/dev/null || insmod cifs 2>/dev/null
+			grep -qw cifs /proc/filesystems 2>/dev/null ;;
+		nfs) command -v mount.nfs >/dev/null 2>&1 ;;
+		*) return 1 ;;
+	esac
+}
+umount_net() {
+	net_mounted >/dev/null || return 0
+	umount "$MNT" 2>/dev/null || umount -l "$MNT" 2>/dev/null
+	rm -f "$RUN_DIR/net.signature"
+}
+mount_reason() { # $1=exit code $2=output
+	[ "$1" = 124 ] && { echo timeout; return; }
+	case "$2" in
+		*"error(13)"*|*"ermission denied"*|*"access denied"*) echo login_refused ;;
+		*"error(2)"*|*"No such file"*|*"No such device"*) echo share_not_found ;;
+		*"error(111)"*|*"onnection refused"*) echo refused ;;
+		*"error(95)"*|*"not supported"*|*"error(22)"*) echo version_mismatch ;;
+		*"error(112)"*|*"error(113)"*|*"error(115)"*|*"error(110)"*|*"Host is down"*|*"No route"*|*"timed out"*) echo unreachable ;;
+		*"resolve"*|*"find suitable address"*|*"bad address"*|*"Name or service"*) echo unreachable ;;
+		*) echo mount_failed ;;
+	esac
+}
+mount_net() {
+	local out rc cred opts pass
+	mkdir -p "$MNT"
+	case $NET_TYPE in
+		smb)
+			pass=$(net_password)
+			opts="uid=0,gid=0,file_mode=0600,dir_mode=0700,soft,noserverino,iocharset=utf8"
+			[ -n "$NET_SMBVER" ] && opts="$opts,vers=$NET_SMBVER"
+			if [ -z "$NET_USER" ] && [ -z "$pass" ]; then
+				opts="guest,$opts"
+				out=$(tmo 20 mount.cifs "//$NET_SERVER/$NET_SHARE" "$MNT" -o "$opts" 2>&1); rc=$?
+			else
+				# Never on the command line: mount.cifs reads it from a file.
+				cred=$RUN_DIR/net.cred
+				( umask 077; { printf 'username=%s\n' "${NET_USER:-guest}"; printf 'password=%s\n' "$pass"; } > "$cred" )
+				out=$(tmo 20 mount.cifs "//$NET_SERVER/$NET_SHARE" "$MNT" -o "credentials=$cred,$opts" 2>&1); rc=$?
+				rm -f "$cred"
+			fi
+			pass=''
+			;;
+		nfs)
+			# soft: a server that goes away makes writes fail, not hang.
+			out=$(tmo 20 mount -t nfs "$NET_SERVER:$NET_SHARE" "$MNT" -o soft,timeo=100,retrans=3,nolock 2>&1); rc=$?
+			;;
+	esac
+	if [ "$rc" = 0 ] && net_mounted >/dev/null; then
+		net_signature > "$RUN_DIR/net.signature"
+		return 0
+	fi
+	[ "$rc" = 0 ] && rc=1
+	NET_REASON=$(mount_reason "$rc" "$out")
+	umount "$MNT" 2>/dev/null
+	return 1
+}
+# Mount the network folder (or keep the mount) and check it takes a write.
+# Sets NET_ROOT, or NET_REASON and returns 1.
+ensure_net() {
+	NET_ROOT=''; NET_REASON=''
+	if [ -z "$NET_SERVER" ] || [ -z "$NET_SHARE" ]; then NET_REASON=not_set; return 1; fi
+	if net_mounted >/dev/null && [ "$(cat "$RUN_DIR/net.signature" 2>/dev/null)" != "$(net_signature)" ]; then
+		umount_net
+	fi
+	if ! net_mounted >/dev/null; then
+		net_support "$NET_TYPE" || { NET_REASON=no_support; return 1; }
+		mount_net || return 1
+	fi
+	NET_ROOT=$MNT; [ -n "$NET_FOLDER" ] && NET_ROOT=$MNT/$NET_FOLDER
+	if ! tmo 20 sh -c 'mkdir -p "$1" && : > "$1/.write-test" && rm -f "$1/.write-test"' _ "$NET_ROOT/redbook/$HOST" 2>/dev/null; then
+		NET_REASON=not_writable; return 1
+	fi
+}
+
+# ----------------------------------------------------------------- storage
+
+# Sets DEST (the folder this router's logs go in), ST_PATH and ST_REASON.
+resolve_storage() {
+	local p
+	DEST=''; ST_REASON=''; ST_PATH=''
+	if [ "$STORAGE" = network ]; then
+		ST_PATH=$(net_label)
+		ensure_net || { ST_REASON=$NET_REASON; return 1; }
+		DEST=$NET_ROOT/redbook/$HOST
+	else
+		[ "$USB_BAD" = 1 ] && { ST_REASON=bad_path; return 1; }
+		p=$USB_PATH
+		[ -n "$p" ] || p=$(list_drives | head -n 1 | cut -d' ' -f1)
+		ST_PATH=$p
+		[ -n "$p" ] && on_usb "$p" || { ST_REASON=no_drive; return 1; }
+		DEST=$p/redbook/$HOST
+		mkdir -p "$DEST" 2>/dev/null && [ -w "$DEST" ] || { ST_REASON=not_writable; return 1; }
+	fi
+	# shellcheck disable=SC2046
+	set -- $(space_kb "$DEST")
+	ST_TOTAL_KB=${1:-}; ST_FREE_KB=${2:-}
+	if [ -n "$ST_FREE_KB" ] && [ "$ST_FREE_KB" -lt "$MIN_FREE_KB" ]; then ST_REASON=full; return 1; fi
+	return 0
+}
+
+# Run a command that writes to the storage with a time limit: a network
+# folder that has gone away must not hang the daemon.
+w() { tmo 120 "$@"; }
+
+ext_for() { case $1 in gzip) echo .gz ;; xz) echo .xz ;; *) echo '' ;; esac; }
+compressor() { case $1 in gzip) echo 'gzip -9 -c' ;; xz) echo 'xz -3 -T1 -c' ;; esac; }
+
+# Add a file's SHA-256 to its folder's SHA256SUMS.
+record_sum() { # $1=folder $2=file name
+	local h
+	h=$(cd "$1" && w sha256sum "$2" 2>/dev/null | cut -d' ' -f1) || return 1
+	[ -n "$h" ] && printf '%s  %s\n' "$h" "$2" | w sh -c 'cat >> "$1"' _ "$1/SHA256SUMS"
+}
+
+# Append the lines in $3 to source $1's file for day $2.
+write_lines() {
+	local d="$DEST/$1" f
+	mkdir -p "$d" 2>/dev/null || return 1
+	if [ -e "$d/$2.log.gz" ] || [ -e "$d/$2.log.xz" ]; then
+		# A finished day: add the late lines as another compressed member
+		# (gzip and xz both read concatenated members back as one file).
+		if [ -e "$d/$2.log.gz" ]; then f=$2.log.gz; else f=$2.log.xz; fi
+		case $f in *.gz) w sh -c 'gzip -9 -c "$1" >> "$2"' _ "$3" "$d/$f" ;; *) w sh -c 'xz -3 -T1 -c "$1" >> "$2"' _ "$3" "$d/$f" ;; esac || return 1
+		record_sum "$d" "$f"
+	else
+		w sh -c 'cat "$1" >> "$2"' _ "$3" "$d/$2.log" || return 1
+		# An uncompressed finished day already has a sum: add the new one.
+		[ "$2" != "$TODAY" ] && grep -q "  $2.log\$" "$d/SHA256SUMS" 2>/dev/null && record_sum "$d" "$2.log"
+	fi
+	return 0
+}
+
+spool_dirs() { local s; for s in $SOURCES; do mkdir -p "$SPOOL/$s"; done; }
+
+# Lines lost while the buffer was full: one line about it goes first.
+write_lost_note() { # $1=source
+	local f="$SPOOL/$1/dropped" n first last note
+	[ -s "$f" ] || return 0
+	read -r n first last < "$f"
+	note=$RUN_DIR/note.$$
+	printf '%s redbook: %s lines of this log were lost between %s and %s: the storage was unavailable and the buffer in memory was full.\n' \
+		"$(stamp)" "$n" "$first" "$last" > "$note"
+	write_lines "$1" "$TODAY" "$note" && rm -f "$f"
+	rm -f "$note"
+}
+
+# Move the buffer to the storage. Stops at the first failure; what is left
+# stays in the buffer for next time.
+flush_spool() {
+	local src f day now moved=0
+	now=$(date +%s)
+	for src in $SOURCES; do
+		for f in "$SPOOL/$src"/*.cur; do
+			[ -e "$f" ] || continue
+			day=${f##*/}; day=${day%.cur}
+			mv "$f" "$SPOOL/$src/$day.$now.out" && moved=1
+		done
+	done
+	# The collectors open their file for each line: give a line that was
+	# being written as the file moved a moment to land.
+	[ "$moved" = 1 ] && sleep 1
+	for src in $SOURCES; do
+		write_lost_note "$src" || return 1
+		for f in "$SPOOL/$src"/*.out; do
+			[ -e "$f" ] || continue
+			day=${f##*/}; day=${day%%.*}
+			write_lines "$src" "$day" "$f" || return 1
+			rm -f "$f"
+		done
+	done
+	return 0
+}
+
+# Bytes of lines waiting in the buffer. Counted
+# from the files, not with du, which charges blocks for every folder.
+spool_bytes() { cat "$SPOOL"/*/*.cur "$SPOOL"/*/*.out 2>/dev/null | wc -c; }
+
+# Keep the buffer under SPOOL_MAX_KB: drop the oldest day of the biggest
+# source and count what was lost.
+cap_spool() {
+	local f src n first last old_n s b best bestb
+	while [ "$(spool_bytes)" -gt $((SPOOL_MAX_KB * 1024)) ]; do
+		best=''; bestb=0
+		for s in $SOURCES; do
+			b=$(cat "$SPOOL/$s"/*.cur "$SPOOL/$s"/*.out 2>/dev/null | wc -c)
+			[ "$b" -gt "$bestb" ] && { best=$s; bestb=$b; }
+		done
+		[ -n "$best" ] || break
+		src=$best
+		f=$(ls -1 "$SPOOL/$src"/*.out "$SPOOL/$src"/*.cur 2>/dev/null | head -n 1)
+		[ -n "$f" ] || break
+		n=$(wc -l < "$f")
+		first=${f##*/}; first=${first%%.*}; last=$(date +%Y-%m-%dT%H:%M)
+		rm -f "$f"
+		if [ -s "$SPOOL/$src/dropped" ]; then
+			read -r old_n first_old _ < "$SPOOL/$src/dropped"
+			n=$((n + old_n)); first=$first_old
+		fi
+		printf '%s %s %s\n' "$n" "$first" "$last" > "$SPOOL/$src/dropped"
+	done
+}
+
+# Compress finished days (before today) and record their checksums.
+finish_days() {
+	local src d f name day ext out
+	ext=$(ext_for "$COMPRESS")
+	for src in $SOURCES; do
+		d=$DEST/$src
+		[ -d "$d" ] || continue
+		for f in "$d"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].log; do
+			[ -e "$f" ] || continue
+			name=${f##*/}; day=${name%.log}
+			[ "$day" = "$TODAY" ] && continue
+			if [ -z "$ext" ]; then
+				grep -q "  $name\$" "$d/SHA256SUMS" 2>/dev/null || record_sum "$d" "$name"
+				continue
+			fi
+			out=$f$ext
+			# shellcheck disable=SC2046
+			w sh -c '$1 "$2" > "$3.part" && mv "$3.part" "$3"' _ "$(compressor "$COMPRESS")" "$f" "$out" || { rm -f "$out.part"; return 1; }
+			rm -f "$f"
+			record_sum "$d" "$name$ext"
+		done
+	done
+}
+
+# Delete days past a source's limit, and their checksum lines.
+prune_dir() { # $1=folder $2=days
+	local cutoff f name d gone=0
+	[ -d "$1" ] || return 0
+	cutoff=$(date -d "@$(( $(date +%s) - $2 * 86400 ))" +%Y%m%d 2>/dev/null) || return 0
+	for f in "$1"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].log*; do
+		[ -e "$f" ] || continue
+		name=${f##*/}; d=$(echo "${name%%.*}" | tr -d -)
+		# Dates compared as YYYYMMDD numbers: busybox test has no reliable "<".
+		if [ "$d" -lt "$cutoff" ]; then w rm -f "$f"; gone=1; fi
+	done
+	if [ "$gone" = 1 ] && [ -f "$1/SHA256SUMS" ]; then
+		( cd "$1" && awk '{ f = $2; if ((getline x < f) >= 0) { close(f); print } }' SHA256SUMS > SHA256SUMS.new && mv SHA256SUMS.new SHA256SUMS )
+	fi
+}
+prune_all() { local s; for s in $SOURCES; do prune_dir "$1/$s" "$(src_days "$s")"; done; }
+
+# ----------------------------------------------------- collected sources
+
+# The system log, the kernel log, firewall blocks and DNS queries all come
+# from logd: one `logread -f` feeds this, which files each line under its
+# source and day. -t adds the exact time of each line ([epoch.ms]), which
+# is how a restart of the collector skips lines it already has; it is taken
+# out again before the line is stored, so files hold what logread shows.
+# Firewall lines are kernel lines with IN= and OUT=; dnsmasq's own query
+# lines (query, forwarded, reply, cached...) never go to the system log,
+# only query lines to "dns", and only while that source is on.
+LOGREAD_AWK='
+BEGIN {
+	split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", mn, " ")
+	for (i = 1; i <= 12; i++) mon[mn[i]] = sprintf("%02d", i)
+	split("emerg alert crit err warn notice info debug", ln, " ")
+	for (i = 1; i <= 8; i++) lv[ln[i]] = i - 1
+	lv["warning"] = 4; lv["error"] = 3; lv["panic"] = 0
+	last = 0
+	if ((getline l < statef) > 0) last = l + 0
+	close(statef)
+}
+$6 ~ /^\[[0-9]+(\.[0-9]+)?\]$/ {
+	e = substr($6, 2, length($6) - 2) + 0
+	if (e <= last) next
+	last = e
+	day = $5 "-" mon[$2] "-" sprintf("%02d", $3)
+	if (day < bootday) day = bootday
+	line = $0
+	sub(/ \[[0-9.]+\]/, "", line)
+	split($7, fl, ".")
+	p = (fl[2] in lv) ? lv[fl[2]] : 6
+	src = ""
+	if (fl[1] == "kern") {
+		if (line ~ /IN=[^ ]* OUT=/) { if (fw) src = "firewall" }
+		else if (p <= klevel) src = "kernel"
+	} else if ($8 ~ /^dnsmasq(\[[0-9]+\])?:$/ && line ~ /dnsmasq(\[[0-9]+\])?: ([0-9]+ [^ ]+ )?(query|forwarded|reply|cached|config|validation|answer|dnssec|ipset|nftset|exceeded|NODATA)/) {
+		if (dns && line ~ /dnsmasq(\[[0-9]+\])?: ([0-9]+ [^ ]+ )?query\[/) src = "dns"
+	} else if (p <= slevel) src = "system"
+	if (src != "") { f = spool "/" src "/" day ".cur"; print line >> f; close(f) }
+	printf "%.3f\n", last > statef; close(statef)
+}'
+
+# New connections, from conntrack's event stream, with the time in front.
+CONN_AWK='
+{
+	sub(/^[ \t]+/, "")
+	if ($0 !~ /^\[/) next
+	t = systime(); f = spool "/conn/" strftime("%Y-%m-%d", t) ".cur"
+	print strftime("%Y-%m-%d %H:%M:%S", t) " " $0 >> f; close(f)
+}'
+
+# A finished mesh log (beerocks_<part>.YYYYMMDD_HHMMSS.log). Its lines carry
+# only the time ("INFO 07:57:12:052 <thread> file.cpp[59] --> text"): the
+# day comes from the file name, plus one when the time wraps past midnight.
+MESH_AWK='
+BEGIN {
+	lv["DEBUG"] = 7; lv["TRACE"] = 7; lv["INFO"] = 6; lv["WARNING"] = 4; lv["WARN"] = 4; lv["ERROR"] = 3; lv["FATAL"] = 2
+	daystart = mktime(substr(start, 1, 4) " " substr(start, 5, 2) " " substr(start, 7, 2) " 00 00 00")
+	prev = -1; keep = 0
+}
+($1 in lv) && $2 ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]:[0-9]+$/ {
+	split($2, t, ":"); s = t[1] * 3600 + t[2] * 60 + t[3]
+	if (prev >= 0 && s < prev - 3600) daystart += 86400
+	prev = s
+	keep = (lv[$1] <= level)
+	if (!keep) next
+	d = strftime("%Y-%m-%d", daystart + 43200)
+	rest = $0; sub(/^[A-Z]+ [0-9:]+ /, "", rest)
+	f = spool "/mesh/" d ".cur"
+	print d " " t[1] ":" t[2] ":" t[3] "." t[4] " " comp " " $1 " " rest >> f; close(f)
+	next
+}
+keep && f != "" { print "    " $0 >> f; close(f) }'
+
+# nginx error.log lines: "2026/11/27 07:21:00 [error] 1234#0: ...".
+WEB_AWK='
+BEGIN { split("emerg alert crit error warn notice info debug", ln, " "); for (i = 1; i <= 8; i++) lv[ln[i]] = i - 1 }
+$1 ~ /^[0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9]$/ {
+	l = substr($3, 2, length($3) - 2)   # busybox awk has no [\[\]]
+	keep = (l in lv) ? (lv[l] <= level) : 1
+	d = $1; gsub("/", "-", d)
+}
+keep && d != "" { f = spool "/web/" d ".cur"; print >> f; close(f) }'
+
+collect_web() {
+	local size off chunk tailb
+	src_on web && [ -f "$WEB_LOG" ] || return 0
+	size=$(wc -c < "$WEB_LOG"); off=$(int_or "$(cat "$RUN_DIR/web.offset" 2>/dev/null)" 0)
+	[ "$size" -lt "$off" ] && off=0   # the file was started again
+	[ "$size" -gt "$off" ] || return 0
+	chunk=$RUN_DIR/web.chunk
+	tail -c +$((off + 1)) "$WEB_LOG" | head -c $((size - off)) > "$chunk"
+	# Only whole lines: a line still being written waits for next time.
+	if [ "$(tail -c 1 "$chunk" | wc -l)" = 0 ]; then
+		tailb=$(tail -n 1 "$chunk" | wc -c)
+		size=$((size - tailb))
+		sed -i '$d' "$chunk"
+	fi
+	awk -v spool="$SPOOL" -v level="$(level_num "$LEVEL_web")" "$WEB_AWK" "$chunk"
+	rm -f "$chunk"
+	echo "$size" > "$RUN_DIR/web.offset"
+}
+
+collect_mesh() {
+	local f name cur start comp
+	src_on mesh && [ -d "$MESH_DIR" ] || return 0
+	touch "$RUN_DIR/mesh.done"
+	# The file each <part>.log link points to is still being written.
+	cur=$(for f in "$MESH_DIR"/*.log; do [ -L "$f" ] && readlink "$f"; done | sed 's|.*/||')
+	for f in "$MESH_DIR"/*.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9].log; do
+		[ -f "$f" ] && [ ! -L "$f" ] || continue
+		name=${f##*/}
+		grep -qxF "$name" "$RUN_DIR/mesh.done" && continue
+		printf '%s\n' "$cur" | grep -qxF "$name" && continue
+		start=${name%.log}; start=${start##*.}
+		comp=${name%%.*}
+		awk -v spool="$SPOOL" -v level="$(level_num "$LEVEL_mesh")" -v start="$start" -v comp="$comp" "$MESH_AWK" "$f"
+		echo "$name" >> "$RUN_DIR/mesh.done"
+	done
+	# Forget files the mesh service has deleted.
+	for name in $(cat "$RUN_DIR/mesh.done"); do [ -e "$MESH_DIR/$name" ] && echo "$name"; done > "$RUN_DIR/mesh.done.new"
+	mv "$RUN_DIR/mesh.done.new" "$RUN_DIR/mesh.done"
+}
+
+# Every 5 minutes: load, memory, temperature, connections, uptime.
+collect_health() {
+	local up last t temp ct
+	src_on health || return 0
+	up=$(uptime_s); last=$(int_or "$(cat "$RUN_DIR/health.last" 2>/dev/null)" 0)
+	[ "$last" -gt 0 ] && [ $((up - last)) -lt 290 ] && return 0
+	echo "$up" > "$RUN_DIR/health.last"
+	temp=''
+	for t in /sys/class/thermal/thermal_zone*/temp; do
+		[ -r "$t" ] || continue
+		t=$(cat "$t" 2>/dev/null); case $t in ''|*[!0-9-]*) continue ;; esac
+		[ -z "$temp" ] || [ "$t" -gt "$temp" ] && temp=$t
+	done
+	ct=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)
+	awk -v up="$up" -v temp="$temp" -v ct="$ct" -v now="$(stamp)" '
+		FILENAME == "/proc/loadavg" { load = $1 "," $2 "," $3; procs = $4 }
+		FILENAME == "/proc/meminfo" && $1 == "MemAvailable:" { avail = $2 }
+		FILENAME == "/proc/meminfo" && $1 == "MemFree:" { free = $2 }
+		END {
+			printf "%s load=%s mem_avail_kb=%s mem_free_kb=%s", now, load, avail, free
+			if (temp != "") printf " temp_c=%.1f", temp / 1000
+			if (ct != "") printf " connections=%s", ct
+			printf " processes=%s uptime_s=%s\n", procs, up
+		}' /proc/loadavg /proc/meminfo >> "$SPOOL/health/$TODAY.cur"
+}
+
+# Once per boot: the whole kernel log since the router started (dmesg), so
+# what happened at boot is kept even though logd started after it.
+collect_dmesg() {
+	local day
+	src_on kernel || return 0
+	[ "$(cat "$RUN_DIR/dmesg.boot" 2>/dev/null)" = "$BOOT_ID" ] && return 0
+	day=$(boot_day)
+	{
+		printf '%s redbook: --- the kernel log since the router started at %s (dmesg) ---\n' "$(stamp)" "$(when $(( $(date +%s) - $(uptime_s) )))"
+		dmesg 2>/dev/null
+		printf '%s redbook: --- end of the kernel log since start ---\n' "$(stamp)"
+	} >> "$SPOOL/kernel/$day.cur"
+	echo "$BOOT_ID" > "$RUN_DIR/dmesg.boot"
+}
+
+# Kernel crash records kept in flash across restarts (pstore, or GL's "log"
+# partition read with oopslog). A record is stored when it changes.
+crash_text() {
+	local f dev
+	if ls /sys/fs/pstore/dmesg* >/dev/null 2>&1; then
+		for f in /sys/fs/pstore/dmesg*; do cat "$f"; echo; done
+		return
+	fi
+	dev=$(awk -F: '/"log"/ { print $1; exit }' /proc/mtd 2>/dev/null)
+	if [ -n "$dev" ] && command -v oopslog >/dev/null 2>&1; then
+		oopslog "/dev/$dev" 2>/dev/null | grep -v '^No logs present'
+		return
+	fi
+	[ -f /tmp/log/crash_log ] && cat /tmp/log/crash_log
+}
+collect_crash() {
+	local up last text sum
+	src_on crash || return 0
+	up=$(uptime_s); last=$(int_or "$(cat "$RUN_DIR/crash.last" 2>/dev/null)" 0)
+	[ "$last" -gt 0 ] && [ $((up - last)) -lt 3600 ] && return 0
+	echo "$up" > "$RUN_DIR/crash.last"
+	text=$(crash_text | tr -d '\000-\010\013-\037' | head -c 262144)
+	[ -n "$(printf '%s' "$text" | tr -d ' \n\t')" ] || return 0
+	sum=$(printf '%s' "$text" | md5sum | cut -c1-32)
+	mkdir -p "$DEST/.state"
+	[ "$(cat "$DEST/.state/crash.md5" 2>/dev/null)" = "$sum" ] && return 0
+	{
+		printf '%s redbook: --- crash record found in flash ---\n' "$(stamp)"
+		printf '%s\n' "$text"
+		printf '%s redbook: --- end of crash record ---\n' "$(stamp)"
+	} >> "$SPOOL/crash/$TODAY.cur"
+	echo "$sum" > "$DEST/.state/crash.md5"
+}
+
+# Once per boot: when the router started, when it was last seen before
+# that, and whether Red Book was stopped cleanly then. Needs the storage,
+# where .state keeps the last-seen time across restarts.
+collect_boot() {
+	local st="$DEST/.state" prev_id alive_at stop_id stop_at boot_at msg fw
+	[ "$(cat "$RUN_DIR/boot.recorded" 2>/dev/null)" = "$BOOT_ID" ] && return 0
+	mkdir -p "$st" 2>/dev/null
+	read -r prev_id alive_at 2>/dev/null < "$st/alive"
+	read -r stop_id stop_at 2>/dev/null < "$st/stopped"
+	if [ "$prev_id" != "$BOOT_ID" ] && src_on boots; then
+		boot_at=$(( $(date +%s) - $(uptime_s) ))
+		fw=$(cat /etc/glversion 2>/dev/null)
+		if [ -z "$prev_id" ]; then
+			msg="Red Book started recording here. The router has been up since $(when "$boot_at")."
+		else
+			msg="The router started at $(when "$boot_at"). Before that it was last seen at $(when "$alive_at")"
+			if [ "$stop_id" = "$prev_id" ] && [ "$(int_or "$stop_at" 0)" -ge "$(int_or "$alive_at" 0)" ]; then
+				msg="$msg, when Red Book was stopped cleanly (a restart or shutdown)."
+			else
+				msg="$msg; it did not shut down cleanly (power loss, a crash or a forced reset)."
+			fi
+		fi
+		printf '%s boot: %s Firmware %s, kernel %s, boot id %s.\n' "$(stamp)" "$msg" "${fw:-unknown}" "$(uname -r)" "$BOOT_ID" \
+			>> "$SPOOL/boots/$TODAY.cur"
+	fi
+	echo "$BOOT_ID" > "$RUN_DIR/boot.recorded"
+}
+
+heartbeat() { mkdir -p "$DEST/.state" 2>/dev/null; echo "$BOOT_ID $(date +%s)" | w sh -c 'cat > "$1"' _ "$DEST/.state/alive"; }
+mark_stopped() { echo "$BOOT_ID $(date +%s)" | w sh -c 'cat > "$1"' _ "$DEST/.state/stopped"; }
+
+# ----------------------------------------------------------------- backup
+
+# Copy the drive's files to the network folder: new and changed files whole
+# (via .part, so a half copy never replaces a good one), today's growing
+# files by appending only what is new.
+sync_backup() {
+	local b src lsrc rsrc f name ls rs
+	BK_STATE=off; BK_REASON=''; BK_PATH=''
+	[ "$STORAGE" = usb ] && [ "$BACKUP" = 1 ] || return 0
+	BK_PATH=$(net_label)
+	ensure_net || { BK_STATE=error; BK_REASON=$NET_REASON; return 1; }
+	b=$NET_ROOT/redbook/$HOST
+	for src in $SOURCES; do
+		[ -d "$DEST/$src" ] || continue
+		w mkdir -p "$b/$src" || { BK_STATE=error; BK_REASON=not_writable; return 1; }
+		lsrc=$(ls -ln "$DEST/$src" | awk 'NF >= 9 { print $9, $5 }')
+		rsrc=$(w ls -ln "$b/$src" | awk 'NF >= 9 { print $9, $5 }') || { BK_STATE=error; BK_REASON=unreachable; return 1; }
+		printf '%s\n' "$lsrc" | while read -r name ls; do
+			[ -n "$name" ] || continue
+			case $name in *.part) continue ;; esac
+			rs=$(printf '%s\n' "$rsrc" | awk -v n="$name" '$1 == n { print $2 }')
+			[ "$rs" = "$ls" ] && continue
+			if [ -n "$rs" ] && [ "$rs" -lt "$ls" ] && [ "${name%.log}" != "$name" ]; then
+				tail -c +$((rs + 1)) "$DEST/$src/$name" | head -c $((ls - rs)) | w sh -c 'cat >> "$1"' _ "$b/$src/$name" || exit 1
+			else
+				w sh -c 'cp "$1" "$2.part" && mv "$2.part" "$2"' _ "$DEST/$src/$name" "$b/$src/$name" || exit 1
+			fi
+		done || { BK_STATE=error; BK_REASON=copy_failed; return 1; }
+		# A day finished on the drive: its plain copy on the share goes.
+		printf '%s\n' "$rsrc" | while read -r name _; do
+			case $name in *.log) ;; *) continue ;; esac
+			[ ! -e "$DEST/$src/$name" ] && { [ -e "$DEST/$src/$name.gz" ] || [ -e "$DEST/$src/$name.xz" ]; } && w rm -f "$b/$src/$name"
+		done
+	done
+	prune_all "$b"
+	BK_STATE=ok
+	date +%s > "$RUN_DIR/backup.ok"
+}
+
+# ------------------------------------------------------------------ flush
+
+write_stats() {
+	local src sep=''
+	{
+		printf '{"at":%s,"path":%s,"sources":{' "$(date +%s)" "$(json_str "$DEST")"
+		for src in $SOURCES; do
+			[ -d "$DEST/$src" ] || continue
+			ls -ln "$DEST/$src" | awk -v today="$TODAY" -v id="$src" -v sep="$sep" '
+				$9 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\.log/ { n++; tot += $5; if (index($9, today) == 1) td += $5; newest = $9 }
+				END { printf "%s\"%s\":{\"files\":%d,\"bytes\":%.0f,\"today_bytes\":%.0f,\"newest\":\"%s\"}", sep, id, n, tot, td, newest }'
+			sep=','
+		done
+		printf '}}'
+	} > "$RUN_DIR/stats.json.new" && mv "$RUN_DIR/stats.json.new" "$RUN_DIR/stats.json"
+}
+
+write_state() { # $1=state
+	printf '{"at":%s,"state":%s,"reason":%s,"kind":%s,"path":%s,"total_kb":%s,"free_kb":%s,"backup":{"state":%s,"reason":%s,"path":%s,"last_ok":%s}}\n' \
+		"$(date +%s)" "$(json_str "$1")" "$(json_str "$ST_REASON")" "$(json_str "$STORAGE")" "$(json_str "$ST_PATH")" \
+		"$(json_num "$ST_TOTAL_KB")" "$(json_num "$ST_FREE_KB")" \
+		"$(json_str "$BK_STATE")" "$(json_str "$BK_REASON")" "$(json_str "$BK_PATH")" "$(json_num "$(cat "$RUN_DIR/backup.ok" 2>/dev/null)")" \
+		> "$RUN_DIR/storage.json.new" && mv "$RUN_DIR/storage.json.new" "$RUN_DIR/storage.json"
+}
+
+do_flush() { # $1=final: the service is stopping
+	local reason
 	load_config
 	mkdir -p "$RUN_DIR" && chmod 700 "$RUN_DIR"
+	exec 9> "$RUN_DIR/lock"
+	flock -x 9 || return 1
+	TODAY=$(date +%Y-%m-%d)
+	ST_REASON=''; ST_PATH=''; ST_TOTAL_KB=''; ST_FREE_KB=''; BK_STATE=off; BK_REASON=''; BK_PATH=''
+	if [ "$ENABLED" != 1 ]; then write_state off; return 0; fi
+	if ! time_synced; then ST_REASON=waiting_clock; write_state waiting; return 0; fi
+	spool_dirs
+	collect_web
+	collect_mesh
+	collect_health
+	if ! resolve_storage; then
+		cap_spool
+		write_state error
+		[ "$(cat "$RUN_DIR/last_reason" 2>/dev/null)" = "$ST_REASON" ] || log "cannot write the logs: $ST_REASON (${ST_PATH:-no path})"
+		echo "$ST_REASON" > "$RUN_DIR/last_reason"
+		return 1
+	fi
+	rm -f "$RUN_DIR/last_reason"
+	collect_boot
+	collect_crash
+	if ! flush_spool; then
+		ST_REASON=write_failed; cap_spool; write_state error; return 1
+	fi
+	finish_days || { ST_REASON=write_failed; write_state error; return 1; }
+	prune_all "$DEST"
+	heartbeat
+	[ "$1" = final ] && mark_stopped
+	sync_backup
+	# A mount nobody needs any more (the settings changed) goes.
+	if [ "$STORAGE" != network ] && [ "$BACKUP" != 1 ]; then umount_net; fi
+	write_stats
+	write_state ok
+	return 0
+}
+
+# --------------------------------------------------------- router settings
+
+APPLIED_FILE() { echo "$STATE_DIR/applied"; }
+applied_get() { sed -n "s/^$1=//p" "$(APPLIED_FILE)" 2>/dev/null | tail -n 1; }
+applied_set() {
+	local f; f=$(APPLIED_FILE)
+	mkdir -p "$STATE_DIR"
+	{ grep -v "^$1=" "$f" 2>/dev/null; printf '%s=%s\n' "$1" "$2"; } > "$f.new" && mv "$f.new" "$f"
+}
+applied_del() {
+	local f; f=$(APPLIED_FILE)
+	[ -f "$f" ] || return 0
+	grep -v "^$1=" "$f" > "$f.new"; mv "$f.new" "$f"
+}
+uci_restore() { # $1=config.section.option $2=saved value ("-" = was not set)
+	if [ "$2" = - ]; then uci -q delete "$1"; else uci set "$1=$2"; fi
+}
+# "section name" for every firewall zone but lan.
+fw_zones() {
+	uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.name='\([A-Za-z0-9_-]*\)'\$/\1 \2/p" |
+		while read -r sec name; do
+			[ "$(uci -q get "firewall.$sec")" = zone ] && [ "$name" != lan ] && echo "$sec $name"
+		done
+}
+
+do_apply() { # $1=revert: undo everything
+	local want sec name prev cur changed
+	want=0; [ "$1" != revert ] && [ "$ENABLED" = 1 ] && src_on dns && want=1
+	if [ $want = 1 ] && [ -z "$(applied_get dns)" ]; then
+		applied_set dns_prev "$(uci -q get dhcp.@dnsmasq[0].logqueries || echo -)"
+		applied_set dns 1
+		uci set dhcp.@dnsmasq[0].logqueries=1 && uci commit dhcp && /etc/init.d/dnsmasq reload >/dev/null 2>&1
+		log "turned on DNS query logging in dnsmasq"
+	elif [ $want = 0 ] && [ -n "$(applied_get dns)" ]; then
+		uci_restore dhcp.@dnsmasq[0].logqueries "$(applied_get dns_prev)"
+		uci commit dhcp && /etc/init.d/dnsmasq reload >/dev/null 2>&1
+		applied_del dns; applied_del dns_prev
+		log "put DNS query logging in dnsmasq back as it was"
+	fi
+
+	want=0; [ "$1" != revert ] && [ "$ENABLED" = 1 ] && src_on firewall && want=1
+	changed=0
+	if [ $want = 1 ]; then
+		for name in $(fw_zones | cut -d' ' -f2); do
+			[ -n "$(applied_get "fw_$name")" ] && continue
+			sec=$(fw_zones | awk -v n="$name" '$2 == n { print $1 }')
+			applied_set "fw_$name" "$(uci -q get "firewall.$sec.log" || echo -)"
+			uci set "firewall.$sec.log=1"; changed=1
+		done
+	else
+		for name in $(sed -n 's/^fw_\([A-Za-z0-9_-]*\)=.*/\1/p' "$(APPLIED_FILE)" 2>/dev/null); do
+			sec=$(fw_zones | awk -v n="$name" '$2 == n { print $1 }')
+			[ -n "$sec" ] && uci_restore "firewall.$sec.log" "$(applied_get "fw_$name")"
+			applied_del "fw_$name"; changed=1
+		done
+	fi
+	if [ $changed = 1 ]; then
+		uci commit firewall && /etc/init.d/firewall reload >/dev/null 2>&1
+		if [ $want = 1 ]; then log "turned on logging of blocked packets in the firewall"; else log "put firewall logging back as it was"; fi
+	fi
+
+	want=0; [ "$1" != revert ] && [ "$ENABLED" = 1 ] && [ "$SYSLOG_SEND" = 1 ] && [ -n "$SYSLOG_SERVER" ] && want=1
+	cur="$SYSLOG_SERVER $SYSLOG_PORT $SYSLOG_PROTO"
+	if [ $want = 1 ] && [ "$(applied_get syslog)" != "$cur" ]; then
+		if [ -z "$(applied_get syslog)" ]; then
+			applied_set syslog_ip "$(uci -q get system.@system[0].log_ip || echo -)"
+			applied_set syslog_port "$(uci -q get system.@system[0].log_port || echo -)"
+			applied_set syslog_proto "$(uci -q get system.@system[0].log_proto || echo -)"
+		fi
+		applied_set syslog "$cur"
+		uci set system.@system[0].log_ip="$SYSLOG_SERVER"
+		uci set system.@system[0].log_port="$SYSLOG_PORT"
+		uci set system.@system[0].log_proto="$SYSLOG_PROTO"
+		uci commit system && /etc/init.d/log reload >/dev/null 2>&1
+		log "sending the system log to $SYSLOG_SERVER port $SYSLOG_PORT ($SYSLOG_PROTO)"
+	elif [ $want = 0 ] && [ -n "$(applied_get syslog)" ]; then
+		uci_restore system.@system[0].log_ip "$(applied_get syslog_ip)"
+		uci_restore system.@system[0].log_port "$(applied_get syslog_port)"
+		uci_restore system.@system[0].log_proto "$(applied_get syslog_proto)"
+		uci commit system && /etc/init.d/log reload >/dev/null 2>&1
+		applied_del syslog; applied_del syslog_ip; applied_del syslog_port; applied_del syslog_proto
+		log "put the syslog server setting back as it was"
+	fi
+	return 0
+}
+
+# -------------------------------------------------------------- collectors
+
+# Each collector is a reader feeding an awk through a FIFO, so both pids are
+# known and both can be stopped (a shell pipeline's first process is not).
+start_collector() { # $1=name $2=awk program, then the reader command
+	local name="$1" prog="$2" fifo apid rpid
+	shift 2
+	fifo=$RUN_DIR/$name.fifo
+	rm -f "$fifo"; mkfifo "$fifo" || return 1
+	awk -v app=redbook -v spool="$SPOOL" -v statef="$RUN_DIR/logread.last" -v bootday="$(boot_day)" \
+		-v slevel="$LR_S" -v klevel="$LR_K" -v dns="$ON_dns" -v fw="$ON_firewall" "$prog" < "$fifo" &
+	apid=$!
+	"$@" > "$fifo" 2>/dev/null &
+	rpid=$!
+	echo "$rpid $apid" > "$RUN_DIR/$name.pids"
+}
+collector_alive() { # $1=name
+	local rpid apid
+	read -r rpid apid 2>/dev/null < "$RUN_DIR/$1.pids" || return 1
+	[ -d "/proc/$rpid" ] && [ -d "/proc/$apid" ]
+}
+stop_collector() { # $1=name
+	local p cmd
+	[ -f "$RUN_DIR/$1.pids" ] || return 0
+	for p in $(cat "$RUN_DIR/$1.pids"); do
+		[ -r "/proc/$p/cmdline" ] || continue
+		cmd=$(tr '\000' ' ' < "/proc/$p/cmdline")
+		case "$cmd" in *app=redbook*|"logread -f -t -l "*|"conntrack -E "*) kill "$p" 2>/dev/null ;; esac
+	done
+	rm -f "$RUN_DIR/$1.pids" "$RUN_DIR/$1.fifo"
+}
+want_logread() { src_on system || src_on kernel || src_on dns || src_on firewall; }
+want_conn() { src_on conn && command -v conntrack >/dev/null 2>&1; }
+start_collectors() {
+	LR_S=-1; src_on system && LR_S=$(level_num "$LEVEL_system")
+	LR_K=-1; src_on kernel && LR_K=$(level_num "$LEVEL_kernel")
+	if want_logread && ! collector_alive logread; then
+		stop_collector logread
+		start_collector logread "$LOGREAD_AWK" logread -f -t -l 100000
+	fi
+	if want_conn && ! collector_alive conn; then
+		stop_collector conn
+		start_collector conn "$CONN_AWK" conntrack -E -e NEW
+	fi
+}
+stop_collectors() { stop_collector logread; stop_collector conn; }
+
+# --------------------------------------------------------------- daemon
+
+# Interruptible sleep (lets the TERM trap run straight away).
+nap() { sleep "$1" & SLEEP_PID=$!; wait "$SLEEP_PID"; SLEEP_PID=''; }
+
+on_stop() {
+	[ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null
+	[ -n "$FLUSH_PID" ] && wait "$FLUSH_PID" 2>/dev/null
+	stop_collectors
+	# The last lines reach the storage before a reboot or a settings change.
+	tmo 15 "$0" flush final >/dev/null 2>&1
+	rm -f "$RUN_DIR/next" "$RUN_DIR/daemon.pid"
+	exit 0
+}
+
+conf_sum() { uci -q show "$CONFIG" | md5sum | cut -c1-32; }
+
+do_daemon() {
+	local up due=0 sum
+	SLEEP_PID=''; FLUSH_PID=''
+	sum=$(conf_sum)
+	load_config
+	mkdir -p "$RUN_DIR" && chmod 700 "$RUN_DIR"
+	echo $$ > "$RUN_DIR/daemon.pid"
+	trap on_stop INT TERM
+	stop_collectors   # left over from a daemon that was killed
+	do_apply
+	# New settings: start again in place (same pid for procd). procd also
+	# restarts us after LuCI's Save & Apply; the GL panel and a plain
+	# `uci commit` do not tell procd, so look every loop.
+	while [ "$ENABLED" != 1 ] || ! time_synced; do
+		[ "$ENABLED" = 1 ] && ( do_flush ) >/dev/null 2>&1   # records "waiting for the clock"
+		nap 30
+		[ "$(conf_sum)" = "$sum" ] || exec "$0" daemon
+	done
+	spool_dirs
+	collect_dmesg
 	while :; do
-		# Settings are re-read every minute, so changes apply even when
-		# procd's config trigger does not restart us.
-		load_config
-		if [ "$ENABLED" != 1 ] || ! time_synced; then
-			rm -f "$RUN_DIR/next"; base=""
-			nap 60
-			continue
+		if [ "$(conf_sum)" != "$sum" ]; then
+			[ -n "$FLUSH_PID" ] && wait "$FLUSH_PID"
+			stop_collectors
+			log "settings changed: starting again"
+			exec "$0" daemon
 		fi
-		# The schedule runs on the router's uptime, so a clock step (NTP
-		# after boot) can neither stall it nor cause a burst of checks.
+		start_collectors   # and again if one has died (logd restarted, ...)
 		up=$(uptime_s)
-		[ -n "$base" ] || base=$(( up - INTERVAL * 60 ))
-		due=$(( base + INTERVAL * 60 ))
-		if [ "$up" -lt "$due" ]; then
-			echo $(( $(date +%s) + due - up )) > "$RUN_DIR/next"
-			nap $(( due - up > 60 ? 60 : due - up ))
-			continue
+		if [ "$up" -ge "$due" ]; then
+			( do_flush ) >/dev/null 2>&1 &
+			FLUSH_PID=$!
+			wait "$FLUSH_PID"; FLUSH_PID=''
+			due=$((up + FLUSH_MIN * 60))
+			echo $(( $(date +%s) + FLUSH_MIN * 60 )) > "$RUN_DIR/next"
 		fi
-		base=$up
-		( do_check ) >/dev/null 2>&1 &
-		CHECK_PID=$!
-		wait "$CHECK_PID"
-		CHECK_PID=""
+		nap 20
 	done
 }
 
-# ------------------------------------------------------------ web interface
-
-all_readings() {
-	local f
-	for f in "$DATA_DIR"/readings/*.csv*; do
-		[ -e "$f" ] || continue
-		case $f in *.gz) gzip -dc "$f" ;; *) cat "$f" ;; esac | sed 1d
-	done
-}
+# ----------------------------------------------------------- web interface
 
 do_status() {
-	local last next
+	local s sep='' running=false dropped spool_kb fw_on=0 sec ip
 	load_config
-	last=$(all_readings 2>/dev/null | tail -n 1)
-	read -r next 2>/dev/null < "$RUN_DIR/next"
-	printf '{"version":%s,"enabled":%s,"interval":%s,"target":%s,"secret_set":%s,"next":%s,"last":%s}\n' \
-		"$(json_str "$VERSION")" "$( [ "$ENABLED" = 1 ] && echo true || echo false)" "$(json_num "$INTERVAL")" \
-		"$(json_str "$TARGET")" "$( [ -n "$SECRET" ] && echo true || echo false)" "$(json_num "$next")" "$(json_str "$last")"
+	read -r s 2>/dev/null < "$RUN_DIR/daemon.pid" && [ -d "/proc/$s" ] && running=true
+	dropped=$(cat "$SPOOL"/*/dropped 2>/dev/null | awk '{ n += $1 } END { print n + 0 }')
+	spool_kb=$(( $(spool_bytes) / 1024 ))
+	for sec in $(fw_zones | cut -d' ' -f1); do [ "$(uci -q get "firewall.$sec.log")" = 1 ] && fw_on=1; done
+	ip=$(uci -q get system.@system[0].log_ip)
+	printf '{"version":%s,"enabled":%s,"running":%s,"host":%s,"lan_ip":%s,"storage_kind":%s,"backup":%s,"compress":%s,"flush_minutes":%s,"next":%s,' \
+		"$(json_str "$VERSION")" "$(json_bool "$ENABLED")" "$running" "$(json_str "$HOST")" "$(json_str "$(uci -q get network.lan.ipaddr | cut -d/ -f1)")" \
+		"$(json_str "$STORAGE")" "$(json_bool "$BACKUP")" "$(json_str "$COMPRESS")" "$FLUSH_MIN" "$(json_num "$(cat "$RUN_DIR/next" 2>/dev/null)")"
+	printf '"clock_set":%s,"net_password_set":%s,"net_mounted":%s,"spool_kb":%s,"dropped":%s,' \
+		"$(time_synced && echo true || echo false)" "$( [ -n "$(net_password)" ] && echo true || echo false)" \
+		"$(net_mounted >/dev/null && echo true || echo false)" "$(json_num "${spool_kb:-0}")" "$(json_num "$dropped")"
+	printf '"support":{"smb":%s,"nfs":%s,"installing":%s,"install_result":%s},' \
+		"$(command -v mount.cifs >/dev/null 2>&1 && echo true || echo false)" "$(command -v mount.nfs >/dev/null 2>&1 && echo true || echo false)" \
+		"$( [ -f "$RUN_DIR/install.pid" ] && [ -d "/proc/$(cat "$RUN_DIR/install.pid")" ] && echo true || echo false)" \
+		"$(json_str "$(cat "$RUN_DIR/install.result" 2>/dev/null)")"
+	printf '"router":{"dns_logging":%s,"firewall_logging":%s,"syslog_server":%s,"changed_by_redbook":%s},' \
+		"$( [ "$(uci -q get dhcp.@dnsmasq[0].logqueries)" = 1 ] && echo true || echo false)" "$(json_bool "$fw_on")" \
+		"$(json_str "${ip:+$ip:$(uci -q get system.@system[0].log_port || echo 514)/$(uci -q get system.@system[0].log_proto || echo udp)}")" \
+		"$(json_str "$(sed -En 's/^(dns|syslog|fw_[A-Za-z0-9_-]*)=.*/\1/p' "$(APPLIED_FILE)" 2>/dev/null | tr '\n' ' ')")"
+	printf '"sources":['
+	for s in $SOURCES; do
+		printf '%s{"id":"%s","on":%s,"days":%s,"level":%s}' "$sep" "$s" "$(src_on "$s" && echo true || echo false)" "$(src_days "$s")" \
+			"$(has_level "$s" && json_str "$(src_level "$s")" || echo null)"
+		sep=','
+	done
+	printf '],"collectors":{"logread":%s,"conn":%s},' \
+		"$(collector_alive logread && echo true || echo false)" "$(collector_alive conn && echo true || echo false)"
+	printf '"storage":'; if [ -s "$RUN_DIR/storage.json" ]; then tr -d '\n' < "$RUN_DIR/storage.json"; else printf null; fi
+	printf ',"stats":'; if [ -s "$RUN_DIR/stats.json" ]; then tr -d '\n' < "$RUN_DIR/stats.json"; else printf null; fi
+	echo '}'
 }
 
-# Readings with SINCE <= ts <= UNTIL as CSV text inside JSON (the pages
-# parse it; JSON-escaping one string is far cheaper than building objects
-# in shell).
-do_data() {
-	local since until
+# The last N lines of a source's newest day, plus what is still in the
+# buffer, as text inside JSON. TEXT filters (case-insensitive, literal).
+do_lines() { # $1=source $2=count $3=text
+	local src="$1" n f file='' pending
 	load_config
-	since=$(int_or "$1" 0); until=$(int_or "$2" 9999999999)
-	printf '{"header":%s,"csv":' "$(json_str "$READINGS_HEADER")"
-	all_readings 2>/dev/null | awk -F, -v s="$since" -v u="$until" '$1 >= s && $1 <= u' |
-		sed 's/\\/\\\\/g; s/"/\\"/g' | awk 'BEGIN { printf "\"" } { printf "%s\\n", $0 } END { printf "\"" }'
+	case " $SOURCES " in *" $src "*) ;; *) echo '{"error":"unknown_source"}'; return ;; esac
+	n=$(int_or "$2" 100); [ "$n" -ge 1 ] || n=1; [ "$n" -le 500 ] || n=500
+	TODAY=$(date +%Y-%m-%d)
+	if resolve_storage && [ -d "$DEST/$src" ]; then
+		# shellcheck disable=SC2010
+		file=$(ls -1 "$DEST/$src" | grep '^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\.log' | sort | tail -n 1)
+	fi
+	printf '{"source":"%s","file":%s,"storage_reason":%s,"text":' "$src" "$(json_str "$file")" "$(json_str "$ST_REASON")"
+	{
+		if [ -n "$file" ]; then
+			case $file in *.gz) w gzip -dc "$DEST/$src/$file" ;; *.xz) w xz -dc "$DEST/$src/$file" ;; *) w tail -n 2000 "$DEST/$src/$file" ;; esac 2>/dev/null
+		fi
+		for pending in "$SPOOL/$src"/*.out "$SPOOL/$src"/*.cur; do [ -f "$pending" ] && cat "$pending"; done
+	} | if [ -n "$3" ]; then grep -iF -e "$3"; else cat; fi | tail -n "$n" | cut -c1-1000 |
+		tr -d '\000-\010\013-\037' | sed 's/\\/\\\\/g; s/"/\\"/g' | awk 'BEGIN { printf "\"" } { printf "%s\\n", $0 } END { printf "\"" }'
 	echo '}'
+}
+
+do_drives() {
+	local sep='' mp fs t f
+	printf '{"drives":['
+	list_drives | while read -r mp fs; do
+		# shellcheck disable=SC2046
+		set -- $(space_kb "$mp")
+		printf '%s{"path":%s,"fs":%s,"total_kb":%s,"free_kb":%s}' "$sep" "$(json_str "$mp")" "$(json_str "$fs")" "$(json_num "$1")" "$(json_num "$2")"
+		sep=','
+	done
+	echo ']}'
 }
 
 do_set_secret() {
@@ -206,30 +1075,76 @@ do_set_secret() {
 	touch /etc/config/${CONFIG}_auth
 	chmod 600 /etc/config/${CONFIG}_auth
 	uci -q get "${CONFIG}_auth.main" >/dev/null || uci set "${CONFIG}_auth.main=auth"
-	uci set "${CONFIG}_auth.main.secret=$s"
+	uci set "${CONFIG}_auth.main.net_password=$s"
 	uci commit "${CONFIG}_auth"
 	chmod 600 /etc/config/${CONFIG}_auth
 	echo '{"ok":true}'
 }
 
-do_clear() {
+do_test_network() {
 	load_config
-	rm -rf "$DATA_DIR/readings"
-	echo '{"ok":true}'
+	mkdir -p "$RUN_DIR" && chmod 700 "$RUN_DIR"
+	exec 9> "$RUN_DIR/lock"
+	flock -x 9
+	if ensure_net; then
+		printf '{"ok":true,"path":%s}\n' "$(json_str "$(net_label)")"
+	else
+		printf '{"ok":false,"reason":%s,"path":%s}\n' "$(json_str "$NET_REASON")" "$(json_str "$(net_label)")"
+	fi
+	# Keep the mount only if the settings use it.
+	[ "$STORAGE" = network ] || [ "$BACKUP" = 1 ] || umount_net
+}
+
+support_packages() {
+	case "$1" in
+		smb) echo 'kmod-fs-cifs cifsmount' ;;
+		nfs) echo 'kmod-fs-nfs kmod-fs-nfs-v3 kmod-fs-nfs-v4 nfs-utils' ;;
+	esac
+}
+do_install_support() {
+	local p
+	load_config
+	[ -n "$(support_packages "$1")" ] || { echo '{"ok":false,"reason":"unknown_type"}'; return; }
+	mkdir -p "$RUN_DIR" && chmod 700 "$RUN_DIR"
+	if read -r p 2>/dev/null < "$RUN_DIR/install.pid" && [ -d "/proc/$p" ]; then echo '{"ok":true,"running":true}'; return; fi
+	# Fully detached: rpcd and the GL panel wait on an open stdout.
+	"$0" install-run "$1" </dev/null >/dev/null 2>&1 &
+	echo '{"ok":true,"started":true}'
+}
+do_install_run() {
+	local rc pkgs
+	load_config
+	pkgs=$(support_packages "$1"); [ -n "$pkgs" ] || return 1
+	echo $$ > "$RUN_DIR/install.pid"
+	# shellcheck disable=SC2086
+	{ opkg update && opkg install $pkgs; } > "$RUN_DIR/install.log" 2>&1
+	rc=$?
+	echo "$1 $rc $(date +%s)" > "$RUN_DIR/install.result"
+	rm -f "$RUN_DIR/install.pid"
+	log "installing support for $1 network folders: $( [ $rc = 0 ] && echo "done" || echo "failed ($rc), see $RUN_DIR/install.log")"
 }
 
 # REDBOOK_LIB=1: only define the functions (for tests).
 [ "${REDBOOK_LIB:-}" = 1 ] && return 0 2>/dev/null
 
 case "$1" in
-	check) do_check ;;
 	daemon) do_daemon ;;
+	flush) do_flush "$2" ;;
+	flush-bg)
+		"$0" flush </dev/null >/dev/null 2>&1 &
+		echo '{"ok":true,"started":true}'
+		;;
 	status) do_status ;;
-	data) do_data "$2" "$3" ;;
+	lines) do_lines "$2" "$3" "$4" ;;
+	drives) do_drives ;;
 	set-secret) do_set_secret ;;
-	clear) do_clear ;;
+	test-network) do_test_network ;;
+	install-support) do_install_support "$2" ;;
+	install-run) do_install_run "$2" ;;
+	apply) load_config; do_apply ;;
+	revert) load_config; do_apply revert; umount_net ;;
 	*)
-		echo "usage: redbook check|daemon|status|data SINCE [UNTIL]|set-secret|clear" >&2
+		echo "usage: redbook daemon|flush|flush-bg|status|lines SRC [N] [TEXT]|drives|set-secret|test-network|install-support smb|nfs|apply|revert" >&2
 		exit 2
 		;;
 esac
