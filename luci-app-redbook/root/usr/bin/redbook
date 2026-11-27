@@ -245,11 +245,26 @@ net_signature() {
 	printf '%s|%s|%s|%s|%s|%s' "$NET_TYPE" "$NET_SERVER" "$NET_SHARE" "$NET_USER" "$NET_SMBVER" \
 		"$(net_password | md5sum | cut -c1-32)"
 }
+# Before Linux 5.15, cifs takes MD4 (the NT hash under every NTLM login) from
+# the kernel's crypto modules, and GL's kmod-fs-cifs does not pull it in:
+# without it every password is refused as wrong (seen on a GL-BE9300, 5.4).
+# From 5.15 on, cifs has its own. KREL: another kernel version, for tests.
+needs_md4() {
+	local maj min
+	maj=$(echo "${KREL:-$(uname -r)}" | cut -d. -f1); min=$(echo "${KREL:-$(uname -r)}" | cut -d. -f2)
+	maj=$(int_or "$maj" 99); min=$(int_or "$min" 0)
+	[ "$maj" -lt 5 ] || { [ "$maj" -eq 5 ] && [ "$min" -lt 15 ]; }
+}
+have_md4() {
+	grep -q '^name *: md4$' /proc/crypto 2>/dev/null || modprobe md4 2>/dev/null || insmod md4 2>/dev/null
+	grep -q '^name *: md4$' /proc/crypto 2>/dev/null
+}
 net_support() {
 	case "$1" in
 		smb) command -v mount.cifs >/dev/null 2>&1 || return 1
 			grep -qw cifs /proc/filesystems 2>/dev/null || modprobe cifs 2>/dev/null || insmod cifs 2>/dev/null
-			grep -qw cifs /proc/filesystems 2>/dev/null ;;
+			grep -qw cifs /proc/filesystems 2>/dev/null || return 1
+			! needs_md4 || have_md4 ;;
 		nfs) command -v mount.nfs >/dev/null 2>&1 ;;
 		*) return 1 ;;
 	esac
@@ -1182,7 +1197,7 @@ do_test_network() {
 
 support_packages() {
 	case "$1" in
-		smb) echo 'kmod-fs-cifs cifsmount' ;;
+		smb) echo "kmod-fs-cifs cifsmount$(needs_md4 && echo ' kmod-crypto-md4')" ;;
 		nfs) echo 'kmod-fs-nfs kmod-fs-nfs-v3 kmod-fs-nfs-v4 nfs-utils' ;;
 	esac
 }

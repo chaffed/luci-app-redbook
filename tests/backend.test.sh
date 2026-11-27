@@ -118,6 +118,16 @@ check "! grep -q 'query\[' $T/system_nodns" "DNS off: query lines are dropped, n
 check "[ ! -s $T/system_off ]" "system log off: nothing is kept"
 check "grep -q 'DROP(src wan)' $T/kernel_nofw" "firewall log off: packet lines stay in the kernel log (GL logs SYN floods that way)"
 
+# SMB support: before Linux 5.15 cifs needs the kernel's MD4 module.
+(
+	REDBOOK_LIB=1 . /usr/bin/redbook
+	KREL=5.4.213 support_packages smb > $T/pk54
+	KREL=5.15.167 support_packages smb > $T/pk515
+	KREL=6.6.73 support_packages smb > $T/pk66
+)
+check "grep -qx 'kmod-fs-cifs cifsmount kmod-crypto-md4' $T/pk54" "SMB support on Linux 5.4 (GL firmware 4.x) includes the MD4 module"
+check "grep -qx 'kmod-fs-cifs cifsmount' $T/pk515 && grep -qx 'kmod-fs-cifs cifsmount' $T/pk66" "SMB support on Linux 5.15 and later does not need it"
+
 # ----------------------------------------------------------- mesh, web
 (
 	REDBOOK_LIB=1 . /usr/bin/redbook

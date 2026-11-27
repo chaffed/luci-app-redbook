@@ -1,0 +1,98 @@
+# A small file server for testing Red Book's network folder against a real
+# router: Debian 12 in a Lima VM, serving SMB (Samba) and NFS (the kernel
+# server), reachable from the LAN through the Mac's address. Made and run by
+# tests/nas/nas.sh, which passes the SMB password as a param.
+#
+# Shares, each with a writable and a read-only one:
+#   SMB  //<mac>/logs       user rbtest, writable
+#   SMB  //<mac>/readonly   user rbtest, read only
+#   NFS  <mac>:/srv/nfs/logs       writable, root kept as root
+#   NFS  <mac>:/srv/nfs/readonly   read only
+base: template://debian-12
+vmType: vz
+cpus: 1
+memory: 1GiB
+disk: 8GiB
+mounts: []
+containerd:
+  system: false
+  user: false
+
+param:
+  PASSWORD: ""
+
+# Lima's forwarder listens on the Mac. On all addresses (0.0.0.0) macOS lets
+# an ordinary user take ports below 1024. NFSv4 needs only TCP 2049, and
+# mount.nfs tries v4 first. Connections reach the VM from a high port
+# through the forwarder, so the NFS exports say "insecure".
+portForwards:
+  - guestPort: 445
+    hostPort: 445
+    hostIP: 0.0.0.0
+  - guestPort: 2049
+    hostPort: 2049
+    hostIP: 0.0.0.0
+  # Nothing else: the VM's other ports (rpcbind 111, NetBIOS 139, ...) stay
+  # in the VM. One rule per guest address, or services listening on all
+  # IPv6 addresses (::) fall through to Lima's default forwarding.
+  - guestIP: 127.0.0.1
+    guestPortRange: [1, 65535]
+    ignore: true
+  - guestIP: 0.0.0.0
+    guestPortRange: [1, 65535]
+    ignore: true
+  - guestIP: "::"
+    guestPortRange: [1, 65535]
+    ignore: true
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/sh
+      set -eu
+      export DEBIAN_FRONTEND=noninteractive
+      command -v smbd >/dev/null && command -v exportfs >/dev/null || {
+        apt-get update -q
+        apt-get install -y -q --no-install-recommends samba nfs-kernel-server
+      }
+
+      id rbtest >/dev/null 2>&1 || useradd -M -s /usr/sbin/nologin rbtest
+      mkdir -p /srv/smb/logs /srv/smb/readonly /srv/nfs/logs /srv/nfs/readonly
+      chown rbtest /srv/smb/logs
+      echo "This share is read only." > /srv/smb/readonly/README
+      echo "This export is read only." > /srv/nfs/readonly/README
+
+      cat > /etc/samba/smb.conf <<'EOF'
+      [global]
+         server role = standalone server
+         map to guest = never
+         server min protocol = SMB2
+         log file = /var/log/samba/log.%m
+         max log size = 1000
+         # Each login and its result (NT_STATUS_...) in log.smbd.
+         log level = 1 auth_audit:3
+      [logs]
+         path = /srv/smb/logs
+         valid users = rbtest
+         read only = no
+      [readonly]
+         path = /srv/smb/readonly
+         valid users = rbtest
+         read only = yes
+      EOF
+      printf '%s\n%s\n' "$PARAM_PASSWORD" "$PARAM_PASSWORD" | smbpasswd -s -a rbtest >/dev/null
+
+      cat > /etc/exports <<'EOF'
+      /srv/nfs/logs     *(rw,sync,no_subtree_check,insecure,no_root_squash)
+      /srv/nfs/readonly *(ro,sync,no_subtree_check,insecure)
+      EOF
+      systemctl enable --now smbd nfs-server >/dev/null 2>&1
+      systemctl restart smbd nfs-server
+      exportfs -ra
+
+probes:
+  - script: |
+      #!/bin/sh
+      set -eu
+      timeout 300 sh -c 'until systemctl is-active -q smbd nfs-server; do sleep 2; done'
+    hint: Samba or the NFS server did not start. See `limactl shell redbook-nas sudo journalctl -u smbd -u nfs-server`.
