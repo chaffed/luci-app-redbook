@@ -585,18 +585,40 @@ END {
 	}
 }'
 
-# nginx error.log lines: "2026/11/27 07:21:00 [error] 1234#0: ...".
+# nginx error.log lines: "2026/11/27 07:21:00 [error] 1234#0: ...". GL
+# firmware puts the old error log back after a restart, so where the last
+# read stopped (kept in RAM) is not enough: the time of the newest line
+# stored, and the lines of that second, are kept with the logs (statef),
+# and anything older or already seen is skipped. Lines without a date
+# follow the line before them.
 WEB_AWK='
-BEGIN { split("emerg alert crit error warn notice info debug", ln, " "); for (i = 1; i <= 8; i++) lv[ln[i]] = i - 1 }
+BEGIN {
+	split("emerg alert crit error warn notice info debug", ln, " "); for (i = 1; i <= 8; i++) lv[ln[i]] = i - 1
+	lastts = ""; n = 0
+	if ((getline l < statef) > 0) { lastts = l; while ((getline l < statef) > 0) { seen[l] = 1; cur[++n] = l } }
+	close(statef)
+	newts = lastts; skip = 1
+}
 $1 ~ /^[0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9]$/ {
+	ts = $1 " " $2
+	skip = (ts < lastts) || (ts == lastts && ($0 in seen))
+	if (skip) next
+	if (ts > newts) { newts = ts; n = 0 }
+	if (ts == newts) cur[++n] = $0
 	l = substr($3, 2, length($3) - 2)   # busybox awk has no [\[\]]
 	keep = (l in lv) ? (lv[l] <= level) : 1
 	d = $1; gsub("/", "-", d)
 }
-keep && d != "" { f = spool "/web/" d ".cur"; print >> f; close(f) }'
+!skip && keep && d != "" { f = spool "/web/" d ".cur"; print >> f; close(f) }
+END {
+	if (newts == "") exit
+	printf "%s\n", newts > (statef ".new")
+	for (i = 1; i <= n; i++) print cur[i] > (statef ".new")
+	close(statef ".new")
+}'
 
 collect_web() {
-	local size off chunk tailb
+	local size off chunk tailb st
 	src_on web && [ -f "$WEB_LOG" ] || return 0
 	size=$(wc -c < "$WEB_LOG"); off=$(int_or "$(cat "$RUN_DIR/web.offset" 2>/dev/null)" 0)
 	[ "$size" -lt "$off" ] && off=0   # the file was started again
@@ -609,7 +631,10 @@ collect_web() {
 		size=$((size - tailb))
 		sed -i '$d' "$chunk"
 	fi
-	awk -v spool="$SPOOL" -v level="$(level_num "$LEVEL_web")" "$WEB_AWK" "$chunk"
+	mkdir -p "$DEST/.state" 2>/dev/null
+	st=$DEST/.state/web.last
+	awk -v spool="$SPOOL" -v level="$(level_num "$LEVEL_web")" -v statef="$st" "$WEB_AWK" "$chunk" &&
+		{ [ ! -f "$st.new" ] || mv "$st.new" "$st"; }
 	rm -f "$chunk"
 	echo "$size" > "$RUN_DIR/web.offset"
 }
@@ -816,7 +841,6 @@ do_flush() { # $1=final: the service is stopping
 	if [ "$ENABLED" != 1 ]; then write_state off; return 0; fi
 	if ! time_synced; then ST_REASON=waiting_clock; write_state waiting; return 0; fi
 	spool_dirs
-	collect_web
 	collect_mesh
 	collect_health
 	if ! resolve_storage; then
@@ -829,6 +853,7 @@ do_flush() { # $1=final: the service is stopping
 	rm -f "$RUN_DIR/last_reason"
 	collect_boot
 	collect_crash
+	collect_web   # its "already stored" mark lives with the logs
 	if ! flush_spool; then
 		ST_REASON=write_failed; cap_spool; write_state error; return 1
 	fi

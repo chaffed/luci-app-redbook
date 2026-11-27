@@ -113,13 +113,18 @@ M
 	ON_mesh=1; LEVEL_mesh=warn
 	collect_mesh; collect_mesh
 	cat $SPOOL/mesh/2026-11-27.cur > $T/mesh27 2>/dev/null; cat $SPOOL/mesh/2026-11-28.cur > $T/mesh28 2>/dev/null
-	WEB_LOG=$T/error.log; ON_web=1; LEVEL_web=warn
+	WEB_LOG=$T/error.log; ON_web=1; LEVEL_web=warn; DEST=$T/dest
 	printf '2026/11/27 07:21:00 [error] 1#0: *5 first error\n2026/11/27 07:21:01 [info] 1#0: chatter\n2026/11/27 07:21:02 [error] 1#0: half a li' > $WEB_LOG
 	collect_web
 	cat $SPOOL/web/*.cur > $T/web1
 	printf 'ne\n' >> $WEB_LOG
 	collect_web
 	cat $SPOOL/web/*.cur > $T/web2
+	# A restart: the offset in RAM is gone, and GL puts the old log back.
+	rm -f $RUN_DIR/web.offset
+	printf '2026/11/27 07:21:03 [error] 1#0: after the restart\n' >> $WEB_LOG
+	collect_web
+	cat $SPOOL/web/*.cur > $T/web3
 )
 check "[ \$(wc -l < $T/mesh27) = 1 ] && grep -q '^2026-11-27 23:59:12.052 beerocks_agent ERROR <beerocks_agent> son_slave_thread.cpp\[1125\] --> before midnight' $T/mesh27" "mesh: kept at level warning, with the day and part name added"
 check "grep -q '^2026-11-28 00:02:00.500 beerocks_agent ERROR' $T/mesh28 && [ \$(grep -c 'continuation of the error' $T/mesh28) = 1 ] && ! grep -q 'info after' $T/mesh28" "mesh: past midnight the next day is used; continuation lines follow their message"
@@ -127,6 +132,7 @@ check "[ \$(grep -c 'after midnight' $T/mesh28) = 2 ] && grep -q '^2026-11-28 00
 check "! grep -q 'still being written' $T/mesh27 $T/mesh28 && [ \$(wc -l < $T/mesh27) = 1 ]" "mesh: the file still being written waits; a file is read once"
 check "grep -q 'first error' $T/web1 && ! grep -q chatter $T/web1 && ! grep -q 'half a li' $T/web1" "web server: errors kept at level warn; a half-written line waits"
 check "grep -q 'half a line' $T/web2 && [ \$(grep -c 'first error' $T/web2) = 1 ]" "web server: the line is taken whole once finished, and nothing twice"
+check "[ \$(grep -c 'first error' $T/web3) = 1 ] && [ \$(grep -c 'half a line' $T/web3) = 1 ] && grep -q 'after the restart' $T/web3" "web server: after a restart that puts the old log back, only new lines are taken"
 
 # ----------------------------------------------------------- the drive
 logger -p user.notice "rbtest-notice-1"
