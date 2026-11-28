@@ -281,7 +281,16 @@ check "[ \"\$(GL_VERSION_FILE=/tmp/glversion redbook status | jsonfilter -e @.su
 uci set redbook.main.net_type=nfs; uci set redbook.main.net_server=192.0.2.9; uci set redbook.main.net_share=/x; uci commit redbook
 check "[ \"\$(GL_VERSION_FILE=/tmp/glversion redbook test-network | jsonfilter -e @.reason)\" = nfs_not_on_gl ]" "GL firmware: the NFS test says why there is no support"
 uci set redbook.main.net_type=smb; uci -q delete redbook.main.net_server; uci -q delete redbook.main.net_share; uci commit redbook
-rm -f /tmp/glversion
+# NFS counts as supported only when the kernel has it, and on GL firmware
+# nothing loads a module to find out.
+mkdir -p /tmp/fakebin; printf '#!/bin/sh\nexit 0\n' > /tmp/fakebin/mount.nfs; chmod 755 /tmp/fakebin/mount.nfs
+grep -vw nfs /proc/filesystems > /tmp/fs-nonfs; { cat /tmp/fs-nonfs; printf 'nodev\tnfs\n'; } > /tmp/fs-nfs
+uci set redbook.main.net_type=nfs; uci set redbook.main.net_server=192.0.2.9; uci set redbook.main.net_share=/x; uci commit redbook
+check "[ \"\$(PATH=/tmp/fakebin:\$PATH FILESYSTEMS=/tmp/fs-nonfs GL_VERSION_FILE=/tmp/glversion redbook test-network | jsonfilter -e @.reason)\" = nfs_not_on_gl ]" "GL firmware: mount.nfs alone is not NFS support (the kernel has none)"
+check "[ \"\$(PATH=/tmp/fakebin:\$PATH FILESYSTEMS=/tmp/fs-nonfs GL_VERSION_FILE=/tmp/glversion redbook status | jsonfilter -e @.support.nfs)\" = false ]" "GL firmware: status says no NFS support while the kernel has none"
+check "[ \"\$(PATH=/tmp/fakebin:\$PATH FILESYSTEMS=/tmp/fs-nfs GL_VERSION_FILE=/tmp/glversion redbook status | jsonfilter -e @.support.nfs)\" = true ]" "GL firmware: NFS counts once the kernel has it (modules loaded by hand)"
+uci set redbook.main.net_type=smb; uci -q delete redbook.main.net_server; uci -q delete redbook.main.net_share; uci commit redbook
+rm -rf /tmp/fakebin /tmp/fs-nonfs /tmp/fs-nfs /tmp/glversion
 check "ubus call luci.redbook status >/dev/null 2>&1 || ! pidof rpcd" "rpcd: the status call answers"
 
 [ "$fail" = 0 ] && echo && echo "all checks passed"
