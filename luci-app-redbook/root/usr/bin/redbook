@@ -52,7 +52,7 @@
 # (dates, source ids), which have no spaces.
 
 CONFIG=redbook
-VERSION=0.1.1   # the package's PKG_VERSION
+VERSION=0.1.2   # the package's PKG_VERSION
 SOURCES='system kernel crash boots health web mesh dns firewall conn'
 
 log() { logger -t redbook "$*" 2>/dev/null; [ -t 2 ] && echo "redbook: $*" >&2; return 0; }
